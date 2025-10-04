@@ -44,10 +44,8 @@ FAN_PATHS=("/system1" "/system1/fans1")
 PROP_CANDIDATES=("speed" "pwm" "duty" "duty_cycle" "fan_speed" "percentage")
 # Allow override of fan property (non-modded)
 ILO_FAN_PROP="${ILO_FAN_PROP:-}"
-# Allow override via space-separated env string, e.g. FAN_IDS_STR="fan1 fan2 fan3 fan4 fan5"
-if [[ -n "${FAN_IDS_STR:-}" ]]; then
-  read -r -a FAN_IDS <<<"$FAN_IDS_STR"
-fi
+# Force controlling only three fans: fan1, fan2, fan3
+FAN_IDS=("fan1" "fan2" "fan3")
 
 # Discover fans using 'fan info' (avoids 'show' calls)
 discover_from_fan_info() {
@@ -72,18 +70,8 @@ if [[ -n "${FAN_P_IDS_STR:-}" ]]; then
   read -r -a P_IDS <<<"$FAN_P_IDS_STR"
 fi
 # If not provided, attempt discovery first, then derive from FAN_IDS
-discover_from_fan_info
-if (( ${#P_IDS[@]} == 0 )); then
-  for f in "${FAN_IDS[@]}"; do
-    if [[ "$f" =~ ^fan([0-9]+)$ ]]; then
-      num=${BASH_REMATCH[1]}
-      # User mapping: ssh fan N corresponds to physical P-ID N+1
-      pid=$(( num + 1 + ILO_PID_OFFSET ))
-      (( pid < 0 )) && pid=0
-      P_IDS+=("$pid")
-    fi
-  done
-fi
+# Hard-code P-IDs for the three fans
+P_IDS=("1" "2" "3")
 
 # Note: We avoid 'show' and 'fans show' for discovery or detection to reduce iLO load.
 

@@ -9,7 +9,7 @@ app = Flask(__name__)
 FAN_CURVE_FILE = os.getenv("FAN_CURVE_FILE", "/opt/dynamic-fan-ui/fan_curve.json")
 FAN_SPEED_FILE = os.getenv("FAN_SPEED_FILE", "/opt/dynamic-fan-ui/fan_speeds.txt")
 UI_CONFIG_FILE = os.getenv("UI_CONFIG_FILE", "/opt/dynamic-fan-ui/ui_config.json")
-FAN_IDS = ["fan1", "fan2", "fan3", "fan4", "fan5"]
+FAN_IDS = ["fan1", "fan2", "fan3"]
 # Allow override via env string: FAN_IDS_STR="fan2 fan3 fan4"
 _ids_env = os.getenv("FAN_IDS_STR", "").strip()
 if _ids_env:
@@ -259,7 +259,7 @@ def _discover_fans() -> List[str]:
                 found = sorted(set(tokens), key=lambda x: int(re.findall(r"\d+", x)[0]))
                 _DISCOVERED_FANS = found
                 return found
-        # fallback to configured list
+        # fallback to configured list (clamped to three fans by FAN_IDS)
         _DISCOVERED_FANS = FAN_IDS[:]
         return _DISCOVERED_FANS
 
@@ -365,14 +365,15 @@ def _compute_pids(fans: List[str]) -> List[int]:
         for f in fans:
             m = re.search(r"(\d+)", f)
             if m:
-                # User reports ssh fan N is physical N+1; adjust by +1 in addition to configured offset
-                pid = int(m.group(1)) + 1 + (ILO_PID_OFFSET or 0)
+                # Hard-code identity mapping: fanN -> P-ID N
+                pid = int(m.group(1))
             else:
                 pid = 0
             if pid < 0:
                 pid = 0
             pids.append(pid)
-        _COMPUTED_PIDS = pids
+        # Clamp to first three P-IDs 1..3
+        _COMPUTED_PIDS = [1, 2, 3][:len(fans)]
         return _COMPUTED_PIDS
 
 
