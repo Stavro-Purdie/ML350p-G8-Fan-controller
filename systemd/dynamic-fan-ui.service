@@ -12,6 +12,7 @@ Restart=always
 RestartSec=2
 Environment=FAN_CURVE_FILE=/opt/dynamic-fan-ui/fan_curve.json
 Environment=FAN_SPEED_FILE=/opt/dynamic-fan-ui/fan_speeds.txt
+Environment=FAN_SPEED_BITS_FILE=/opt/dynamic-fan-ui/fan_speeds_bits.txt
 # iLO config also used for temp reads
 Environment=ILO_IP=192.168.1.100
 Environment=ILO_USER=admin
@@ -20,6 +21,7 @@ Environment=ILO_SSH_KEY=/root/.ssh/ilo_key
 # Environment=ILO_PASSWORD=
 # Optional IPMI temps
 # Environment=USE_IPMI_TEMPS=1
+Environment=PWM_UNITS=bits
 
 [Install]
 WantedBy=multi-user.target

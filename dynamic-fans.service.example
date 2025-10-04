@@ -1,0 +1,32 @@
+[Unit]
+Description=Dynamic Fans Controller (HP Gen8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Preset environment for zero-config run
+Environment=ILO_IP=192.168.1.100
+Environment=ILO_USER=admin
+Environment=ILO_SSH_KEY=/root/.ssh/ilo_key
+Environment=PWM_UNITS=bits
+Environment=CHECK_INTERVAL=1
+Environment=ILO_CMD_GAP_MS=1000
+Environment=FAN_P_IDS_STR="1 2 3"
+Environment=FAN_IDS_STR="fan2 fan3 fan4"
+Environment=FAN_CURVE_FILE=/opt/dynamic-fan-ui/fan_curve.json
+Environment=FAN_SPEED_FILE=/opt/dynamic-fan-ui/fan_speeds.txt
+Environment=FAN_SPEED_BITS_FILE=/opt/dynamic-fan-ui/fan_speeds_bits.txt
+
+# Ensure target directories exist (optional if pre-created)
+ExecStartPre=/bin/mkdir -p /opt/dynamic-fan-ui
+
+# Run the controller script
+ExecStart=/bin/bash -lc '/usr/bin/env VERBOSE=0 /bin/bash %h/ML350p-G8-Fan-controller/dynamic_fans.sh'
+
+# Restart policy
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

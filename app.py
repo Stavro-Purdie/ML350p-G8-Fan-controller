@@ -41,9 +41,9 @@ try:
 except Exception:
     ILO_SSH_PERSIST = 60
 try:
-    ILO_CMD_GAP_MS = int(os.getenv("ILO_CMD_GAP_MS", "75"))
+    ILO_CMD_GAP_MS = int(os.getenv("ILO_CMD_GAP_MS", "1000"))
 except Exception:
-    ILO_CMD_GAP_MS = 75
+    ILO_CMD_GAP_MS = 1000
 try:
     ILO_BATCH_SIZE = int(os.getenv("ILO_BATCH_SIZE", "1"))
 except Exception:
@@ -476,8 +476,8 @@ def ilo_set_speed_percent_modded(pid: int, percent: int) -> bool:
     except Exception:
         ok = False
     try:
-        # increased delay to help iLO apply sequentially
-        time.sleep(2.0)
+        # fixed 1s pacing between max/min
+        time.sleep(max(1.0, ILO_CMD_GAP_MS/1000.0))
         _ilo_run(f"fan p {pid} min {vmin}")
     except Exception:
         ok = False
@@ -825,8 +825,8 @@ def _run_quick_test(percent: int, duration: int):
                 except Exception:
                     pass
                 try:
-                    # Use a larger gap for tests to ensure reliability on iLO
-                    time.sleep(max(2.0, ILO_CMD_GAP_MS/1000.0))
+                    # Fixed gap between max/min
+                    time.sleep(max(1.0, ILO_CMD_GAP_MS/1000.0))
                 except Exception:
                     pass
                 try:
@@ -834,7 +834,7 @@ def _run_quick_test(percent: int, duration: int):
                 except Exception:
                     pass
                 try:
-                    time.sleep(max(2.0, ILO_CMD_GAP_MS/1000.0))
+                    time.sleep(max(1.0, ILO_CMD_GAP_MS/1000.0))
                 except Exception:
                     pass
         else:
@@ -1014,12 +1014,12 @@ def fan_test_bits():
             _ilo_run(f"fan p {pid} max {raw}")
         except Exception:
             pass
-        time.sleep(max(2.0, ILO_CMD_GAP_MS/1000.0))
+        time.sleep(max(1.0, ILO_CMD_GAP_MS/1000.0))
         try:
             _ilo_run(f"fan p {pid} min {vmin}")
         except Exception:
             pass
-        time.sleep(max(2.0, ILO_CMD_GAP_MS/1000.0))
+        time.sleep(max(1.0, ILO_CMD_GAP_MS/1000.0))
     # Resume daemon
     if shutil.which("systemctl"):
         subprocess.Popen(["systemctl", "start", "dynamic-fans.service"])  # async

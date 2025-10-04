@@ -2,47 +2,45 @@
 
 Flask UI + Bash daemon to control HP ML350p Gen8 fans (iLO 4) based on CPU/GPU temperatures.
 
-## Components
-- `dynamic_fans.sh` (daemon): Reads temps (CPU via iLO SSH or IPMI, GPU via nvidia-smi), computes target from a linear fan curve, applies stepped changes to iLO fans, persists last speeds.
-- `app.py` (Flask UI): Shows temps and fan speeds, lets you edit the fan curve, and start/stop the systemd service. Polls `/status` every 5s. `/test_ilo` checks connectivity.
-- `systemd/dynamic-fans.service`: Sample systemd unit to run the daemon.
+## Preset configuration (zero-tweak)
+- Raw PWM (bits) mode by default; UI converts for display
+- iLO modded control enabled; mapping: fan2→PID1, fan3→PID2, fan4→PID3
+- Fixed pacing: 1 second between iLO commands
+- Control loop interval: 1 second
+- Min window: min = max − 4 (bits)
+- Files:
+	- fan curve: `/opt/dynamic-fan-ui/fan_curve.json` (auto-created with checkInterval=1, maxStep=20)
+	- last speeds: `/opt/dynamic-fan-ui/fan_speeds.txt`
+	- last speeds (bits): `/opt/dynamic-fan-ui/fan_speeds_bits.txt`
 
-## Install
-Interactive installer lets you choose auth and options.
+## Components
+- `dynamic_fans.sh` (daemon): Reads temps (CPU via iLO SSH or IPMI, GPU via nvidia-smi), computes target from a linear fan curve, applies speeds via modded iLO, persists last speeds.
+- `app.py` (Flask UI): Shows temps and fan speeds, lets you edit the fan curve, start/stop the systemd service, and run quick tests.
+- `dynamic-fans.service.example`: Example systemd unit wired with presets.
+
+## Quick start
+1) Optional: run the daemon as a service using the example unit
 
 ```bash
-./install.sh
+sudo cp dynamic-fans.service.example /etc/systemd/system/dynamic-fans.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now dynamic-fans.service
 ```
 
-What it does:
-- Installs `dynamic_fans.sh` to `/usr/local/bin/dynamic_fans.sh`
-- Creates `/opt/dynamic-fan-ui/{fan_curve.json,fan_speeds.txt}`
-- Optionally installs and enables `dynamic-fans.service` and writes overrides at `/etc/systemd/system/dynamic-fans.service.d/override.conf`
+2) Run the web UI for development
 
-Auth options:
-- SSH key: provide path (e.g., `/root/.ssh/ilo_key`)
-- Password: set during install (requires `sshpass` on host)
+```bash
+python3 app.py
+```
 
-IPMI option:
-- You can use IPMI for CPU temperatures (`USE_IPMI_TEMPS=1`) if `ipmitool` is installed. Fan control still uses iLO CLI.
+Browse to http://0.0.0.0:5000
 
-## Run
-- Start service: `sudo systemctl start dynamic-fans.service`
-- Stop service: `sudo systemctl stop dynamic-fans.service`
-- Dev UI: `python3 app.py` (http://0.0.0.0:5000)
-- Connectivity check: `GET /test_ilo`
-
-## Fan curve
-JSON: `{ "minTemp": 30, "maxTemp": 80, "minSpeed": 20, "maxSpeed": 100 }`
-- File: `/opt/dynamic-fan-ui/fan_curve.json`
-- Update via UI form, saved as above
-
-## Environment
-- Paths: `FAN_CURVE_FILE`, `FAN_SPEED_FILE` (defaults under `/opt/dynamic-fan-ui/`)
-- Auth: `ILO_IP`, `ILO_USER`, `ILO_SSH_KEY`, `ILO_PASSWORD`
-- Loop: `CHECK_INTERVAL`, `MAX_STEP`, `USE_IPMI_TEMPS`
+## Tuning (optional)
+You can still tweak via env or curve JSON:
+- CHECK_INTERVAL (seconds), ILO_CMD_GAP_MS (ms)
+- Curve: min/max temps & speeds; `maxStep`, `minChange`, optional GPU curve
 
 ## Notes
-- GPU temps require `nvidia-smi`.
-- IPMI read only; fan control remains via iLO `set /system1/<fan> speed=<N>`.
-- Ensure both the daemon and the Flask app can read/write `/opt/dynamic-fan-ui/*`.
+- Ensure iLO SSH key path/permissions are correct for the service user.
+- Use `ILO_SSH_LEGACY=1` for older iLO cipher support.
+- GPU telemetry requires `nvidia-smi`.

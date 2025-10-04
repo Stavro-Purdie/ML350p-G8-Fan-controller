@@ -31,8 +31,8 @@ INSTALL_SYSTEMD=${INSTALL_SYSTEMD:-yes}
 ILO_SSH_LEGACY=${ILO_SSH_LEGACY:-0}
 START_NOW=${START_NOW:-yes}
 FAN_IDS_STR=${FAN_IDS_STR:-}
-RUN_RAMP_TEST=${RUN_RAMP_TEST:-yes}
-ILO_MODDED=${ILO_MODDED:-0}
+RUN_RAMP_TEST=${RUN_RAMP_TEST:-no}
+ILO_MODDED=${ILO_MODDED:-1}
 FAN_P_IDS_STR=${FAN_P_IDS_STR:-}
 ILO_PID_OFFSET=${ILO_PID_OFFSET:--1}
 
@@ -70,8 +70,8 @@ if [[ "$sysd" =~ ^[Yy]$ ]]; then INSTALL_SYSTEMD=yes; else INSTALL_SYSTEMD=no; f
 read -r -p "Start services now after install? (y/n) [y]: " start_now
 start_now=${start_now:-y}
 if [[ "$start_now" =~ ^[Yy]$ ]]; then START_NOW=yes; else START_NOW=no; fi
-read -r -p "Run a brief fan ramp test now (100% for 10s)? (y/n) [y]: " ramp
-ramp=${ramp:-y}
+read -r -p "Run a brief fan ramp test now (100% for 10s)? (y/n) [n]: " ramp
+ramp=${ramp:-n}
 if [[ "$ramp" =~ ^[Yy]$ ]]; then RUN_RAMP_TEST=yes; else RUN_RAMP_TEST=no; fi
 read -r -p "Is your iLO modded for 1-255 fan control (fan p <id> ...)? (y/n) [n]: " modded
 modded=${modded:-n}
@@ -162,8 +162,11 @@ Environment=ILO_SSH_KEY=$ILO_SSH_KEY
 Environment=ILO_PASSWORD=$ILO_PASSWORD
 Environment=FAN_CURVE_FILE=$APP_DIR/fan_curve.json
 Environment=FAN_SPEED_FILE=$APP_DIR/fan_speeds.txt
-Environment=CHECK_INTERVAL=5
-Environment=MAX_STEP=10
+Environment=FAN_SPEED_BITS_FILE=$APP_DIR/fan_speeds_bits.txt
+Environment=PWM_UNITS=bits
+Environment=CHECK_INTERVAL=1
+Environment=MAX_STEP=20
+Environment=ILO_CMD_GAP_MS=1000
 Environment=USE_IPMI_TEMPS=$USE_IPMI_TEMPS
 Environment=ILO_SSH_LEGACY=$ILO_SSH_LEGACY
 Environment=FAN_IDS_STR=$FAN_IDS_STR
@@ -178,6 +181,7 @@ EOF
 [Service]
 Environment=FAN_CURVE_FILE=$APP_DIR/fan_curve.json
 Environment=FAN_SPEED_FILE=$APP_DIR/fan_speeds.txt
+Environment=FAN_SPEED_BITS_FILE=$APP_DIR/fan_speeds_bits.txt
 Environment=ILO_IP=$ILO_IP
 Environment=ILO_USER=$ILO_USER
 Environment=ILO_SSH_KEY=$ILO_SSH_KEY
@@ -188,6 +192,7 @@ Environment=FAN_IDS_STR=$FAN_IDS_STR
 Environment=ILO_MODDED=$ILO_MODDED
 Environment=FAN_P_IDS_STR=$FAN_P_IDS_STR
 Environment=ILO_PID_OFFSET=$ILO_PID_OFFSET
+Environment=PWM_UNITS=bits
 WorkingDirectory=$APP_DIR/app
 EOF
 

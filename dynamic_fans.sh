@@ -20,8 +20,8 @@ ILO_SSH_TTY="${ILO_SSH_TTY:-1}"
 VERBOSE="${VERBOSE:-0}"
 ILO_SSH_TIMEOUT="${ILO_SSH_TIMEOUT:-12}"
 ILO_SSH_PERSIST="${ILO_SSH_PERSIST:-60}"
-# Default pacing gap between iLO commands (ms); increase for flaky shells
-ILO_CMD_GAP_MS="${ILO_CMD_GAP_MS:-2000}"
+# Default pacing gap between iLO commands (ms) — fixed to 1 second per request
+ILO_CMD_GAP_MS="${ILO_CMD_GAP_MS:-1000}"
 ILO_BATCH_SIZE="${ILO_BATCH_SIZE:-1}"
 # Simple millisecond sleep without external deps
 sleep_ms() {
@@ -97,7 +97,7 @@ send_exact_modded() {
 
 # Note: We avoid 'show' and 'fans show' for discovery or detection to reduce iLO load.
 
-CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-1}"
 MAX_STEP="${MAX_STEP:-10}"
 FAN_SPEED_FILE="${FAN_SPEED_FILE:-/opt/dynamic-fan-ui/fan_speeds.txt}"
 FAN_SPEED_BITS_FILE="${FAN_SPEED_BITS_FILE:-/opt/dynamic-fan-ui/fan_speeds_bits.txt}"
@@ -181,7 +181,9 @@ cat > "$FAN_CURVE_FILE" <<EOF
   "minTemp": 30,
   "maxTemp": 80,
   "minSpeed": 20,
-  "maxSpeed": 100
+  "maxSpeed": 100,
+  "checkInterval": 1,
+  "maxStep": 20
 }
 EOF
 fi
@@ -288,7 +290,7 @@ apply_fan_speed() {
       # All fans follow same target percent
       local desired=$target
       # When operating in bits domain, do smoothing in bits
-      if [[ "$PWM_UNITS" == "bits" ]]; then
+  if [[ "$PWM_UNITS" == "bits" ]]; then
         # current bits fallback from current percent
         local cur_b=${LAST_BITS[$fan]:-0}
         if (( cur_b <= 0 )); then cur_b=$(( (CURRENT * 255 + 50) / 100 )); fi
