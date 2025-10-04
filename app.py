@@ -237,6 +237,15 @@ def _discover_fans() -> list[str]:
         if _DISCOVERED_FANS is not None:
             return _DISCOVERED_FANS
         found: list[str] = []
+        # Prefer concise 'fans show' listing if available
+        try:
+            out = _ilo_run("fans show")
+            toks = re.findall(r"\bfan\d+\b", out.lower())
+            if toks:
+                _DISCOVERED_FANS = sorted(set(toks), key=lambda x: int(re.findall(r"\d+", x)[0]))
+                return _DISCOVERED_FANS
+        except Exception:
+            pass
         for p in FAN_PATHS:
             try:
                 out = _ilo_run(f"show {p}")
@@ -262,6 +271,37 @@ def _detect_fan_prop() -> tuple[str | None, str | None]:
         # If user provided override, probe to confirm works on first fan
         fans = _discover_fans()
         sample = fans[0] if fans else "fan1"
+        # Prefer explicit /system1/fanX read
+        for cmd in (f"show /system1/{sample}", f"show -a /system1/{sample}"):
+            try:
+                out = _ilo_run(cmd)
+                for line in out.splitlines():
+                    if '=' in line or ':' in line:
+                        parts = re.split(r"[:=]", line, maxsplit=1)
+                        if len(parts) < 2:
+                            continue
+                        key = parts[0].strip().lower()
+                        if any(k in key for k in ("speed","pwm","duty")):
+                            _DETECTED_PROP, _DETECTED_PATH = key, "/system1"
+                            return _DETECTED_PROP, _DETECTED_PATH
+            except Exception:
+                pass
+        # Try 'fans X show' form
+        mnum = re.search(r"(\d+)", sample)
+        if mnum:
+            try:
+                out = _ilo_run(f"fans {mnum.group(1)} show")
+                for line in out.splitlines():
+                    if '=' in line or ':' in line:
+                        parts = re.split(r"[:=]", line, maxsplit=1)
+                        if len(parts) < 2:
+                            continue
+                        key = parts[0].strip().lower()
+                        if any(k in key for k in ("speed","pwm","duty")):
+                            _DETECTED_PROP, _DETECTED_PATH = key, "fans"
+                            return _DETECTED_PROP, _DETECTED_PATH
+            except Exception:
+                pass
         if ILO_FAN_PROP:
             for prefix in FAN_PATHS:
                 try:
@@ -353,6 +393,25 @@ def ilo_set_speed_percent_normal(fan: str, percent: int) -> bool:
                 return True
             except Exception:
                 continue
+    # Fallback to 'fans X' CLI forms if fan name contains a number
+    m = re.search(r"(\d+)", fan)
+    if m:
+        num = m.group(1)
+        for pr in candidates:
+            try:
+                _ilo_run(f"fans {num} {pr}={percent}")
+                with _detect_lock:
+                    global _DETECTED_PROP, _DETECTED_PATH
+                    _DETECTED_PROP, _DETECTED_PATH = pr, "fans"
+                return True
+            except Exception:
+                try:
+                    _ilo_run(f"fans {num} set {pr} {percent}")
+                    with _detect_lock:
+                        _DETECTED_PROP, _DETECTED_PATH = pr, "fans"
+                    return True
+                except Exception:
+                    continue
     return False
 
 

@@ -66,6 +66,19 @@ fi
 # Attempt auto-discovery of fan objects if FAN_IDS appears invalid
 auto_discover_fans() {
   local discovered=()
+  # First, try the concise fans listing if available
+  local out
+  out=$(ssh_ilo "fans show" 2>/dev/null || true)
+  if [[ -n "$out" ]]; then
+    while read -r tok; do
+      [[ -n "$tok" ]] && discovered+=("$tok")
+    done < <(echo "$out" | tr 'A-Z' 'a-z' | grep -oE 'fan[0-9]+' | sort -u)
+    if (( ${#discovered[@]} > 0 )); then
+      echo "Auto-discovered via 'fans show': ${discovered[*]}" >&2
+      FAN_IDS=("${discovered[@]}")
+      return
+    fi
+  fi
   for p in "${FAN_PATHS[@]}"; do
     local out
     out=$(ssh_ilo "show $p" 2>/dev/null || true)
@@ -73,7 +86,7 @@ auto_discover_fans() {
       # Look for tokens like fan1, fan2 etc.
       while read -r tok; do
         [[ -n "$tok" ]] && discovered+=("$tok")
-      done < <(echo "$out" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^fan[0-9]+$/) print $i}' | sort -u)
+      done < <(echo "$out" | tr 'A-Z' 'a-z' | grep -oE 'fan[0-9]+' | sort -u)
     fi
     if (( ${#discovered[@]} > 0 )); then
       echo "Auto-discovered fans at $p: ${discovered[*]}" >&2
@@ -86,6 +99,32 @@ auto_discover_fans() {
 # Discover a usable fan property (percent-like) from iLO output
 detect_fan_prop() {
   local fan_sample="${FAN_IDS[0]}" prop=""
+  # Prefer explicit path under /system1 for the sample fan
+  local out
+  out=$(ssh_ilo "show /system1/$fan_sample" 2>/dev/null || ssh_ilo "show -a /system1/$fan_sample" 2>/dev/null || true)
+  if [[ -n "$out" ]]; then
+    prop=$(echo "$out" | tr -d '\r' | grep -iE 'speed|pwm|duty' | head -1 \
+      | sed -E 's/^[[:space:]]*([^:=[:space:]]+)[[:space:]]*[:=].*/\1/i' | tr '[:upper:]' '[:lower:]')
+    if [[ -n "$prop" ]]; then
+      echo "Detected fan property: $prop on /system1/$fan_sample" >&2
+      ILO_FAN_PROP="$prop"
+      return 0
+    fi
+  fi
+  # Try 'fans X show' where X is the numeric index extracted from fan name
+  if [[ "$fan_sample" =~ ^fan([0-9]+)$ ]]; then
+    local num=${BASH_REMATCH[1]}
+    out=$(ssh_ilo "fans $num show" 2>/dev/null || true)
+    if [[ -n "$out" ]]; then
+      prop=$(echo "$out" | tr -d '\r' | grep -iE 'speed|pwm|duty' | head -1 \
+        | sed -E 's/^[[:space:]]*([^:=[:space:]]+)[[:space:]]*[:=].*/\1/i' | tr '[:upper:]' '[:lower:]')
+      if [[ -n "$prop" ]]; then
+        echo "Detected fan property: $prop on fans $num show" >&2
+        ILO_FAN_PROP="$prop"
+        return 0
+      fi
+    fi
+  fi
   for prefix in "${FAN_PATHS[@]}"; do
     local out
     out=$(ssh_ilo "show -a $prefix/$fan_sample" 2>/dev/null || ssh_ilo "show $prefix/$fan_sample" 2>/dev/null || true)
@@ -257,6 +296,26 @@ apply_fan_speed() {
       done
       [[ $ok -eq 0 ]] && break
     done
+    # If still not ok, try 'fans X' form
+    if (( ok != 0 )); then
+      if [[ "$fan" =~ ^fan([0-9]+)$ ]]; then
+        local num=${BASH_REMATCH[1]}
+        if [[ -n "$ILO_FAN_PROP" ]]; then
+          if ssh_ilo "fans $num $ILO_FAN_PROP=$val" >/dev/null 2>&1; then ok=0; fi
+          if (( ok != 0 )); then
+            ssh_ilo "fans $num set $ILO_FAN_PROP $val" >/dev/null 2>&1 && ok=0
+          fi
+        fi
+        if (( ok != 0 )); then
+          for prop in "${PROP_CANDIDATES[@]}"; do
+            if ssh_ilo "fans $num $prop=$val" >/dev/null 2>&1; then ok=0; ILO_FAN_PROP="$prop"; break; fi
+            if (( ok != 0 )); then
+              ssh_ilo "fans $num set $prop $val" >/dev/null 2>&1 && { ok=0; ILO_FAN_PROP="$prop"; break; }
+            fi
+          done
+        fi
+      fi
+    fi
     return $ok
   }
   if [[ "$ILO_MODDED" == "1" ]]; then
