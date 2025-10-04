@@ -36,22 +36,41 @@ sleep_ms() {
 }
 
 FAN_IDS=("fan1" "fan2" "fan3" "fan4" "fan5")
-# Allow overriding the base path(s) to fan objects
+# Allow overriding the base path(s) to fan objects (used only for non-modded 'set' paths)
 FAN_PATHS=("/system1" "/system1/fans1")
-# Candidate property names to try if not specified
+# Candidate property names to try if not specified (non-modded control)
 PROP_CANDIDATES=("speed" "pwm" "duty" "duty_cycle" "fan_speed" "percentage")
-# Allow override of fan property
+# Allow override of fan property (non-modded)
 ILO_FAN_PROP="${ILO_FAN_PROP:-}"
 # Allow override via space-separated env string, e.g. FAN_IDS_STR="fan1 fan2 fan3 fan4 fan5"
 if [[ -n "${FAN_IDS_STR:-}" ]]; then
   read -r -a FAN_IDS <<<"$FAN_IDS_STR"
 fi
+
+# Discover fans using 'fan info' (avoids 'show' calls)
+discover_from_fan_info() {
+  local out nums=()
+  out=$(ssh_ilo "fan info" 2>/dev/null || true)
+  if [[ -n "$out" ]]; then
+    # Extract occurrences like 'fan<number>' or 'Fan <number>'
+    mapfile -t nums < <(echo "$out" | tr 'A-Z' 'a-z' | grep -oE 'fan[[:space:]]*[0-9]+' | sed -E 's/[^0-9]+//g' | sort -nu)
+    if (( ${#nums[@]} > 0 )); then
+      FAN_IDS=()
+      for n in "${nums[@]}"; do
+        [[ -n "$n" ]] && FAN_IDS+=("fan$n")
+      done
+      [[ "$VERBOSE" == "1" ]] && echo "[discover] fan info -> ${FAN_IDS[*]}" >&2
+    fi
+  fi
+}
+
 # Optional numeric P-IDs for modded iLO commands
 P_IDS=()
 if [[ -n "${FAN_P_IDS_STR:-}" ]]; then
   read -r -a P_IDS <<<"$FAN_P_IDS_STR"
 fi
-# Derive P-IDs from FAN_IDS if not provided (strip 'fan' prefix)
+# If not provided, attempt discovery first, then derive from FAN_IDS
+discover_from_fan_info
 if (( ${#P_IDS[@]} == 0 )); then
   for f in "${FAN_IDS[@]}"; do
     if [[ "$f" =~ ^fan([0-9]+)$ ]]; then
@@ -63,91 +82,7 @@ if (( ${#P_IDS[@]} == 0 )); then
   done
 fi
 
-# Attempt auto-discovery of fan objects if FAN_IDS appears invalid
-auto_discover_fans() {
-  local discovered=()
-  # First, try the concise fans listing if available
-  local out
-  out=$(ssh_ilo "fans show" 2>/dev/null || true)
-  if [[ -n "$out" ]]; then
-    while read -r tok; do
-      [[ -n "$tok" ]] && discovered+=("$tok")
-    done < <(echo "$out" | tr 'A-Z' 'a-z' | grep -oE 'fan[0-9]+' | sort -u)
-    if (( ${#discovered[@]} > 0 )); then
-      echo "Auto-discovered via 'fans show': ${discovered[*]}" >&2
-      FAN_IDS=("${discovered[@]}")
-      return
-    fi
-  fi
-  for p in "${FAN_PATHS[@]}"; do
-    local out
-    out=$(ssh_ilo "show $p" 2>/dev/null || true)
-    if [[ -n "$out" ]]; then
-      # Look for tokens like fan1, fan2 etc.
-      while read -r tok; do
-        [[ -n "$tok" ]] && discovered+=("$tok")
-      done < <(echo "$out" | tr 'A-Z' 'a-z' | grep -oE 'fan[0-9]+' | sort -u)
-    fi
-    if (( ${#discovered[@]} > 0 )); then
-      echo "Auto-discovered fans at $p: ${discovered[*]}" >&2
-      FAN_IDS=("${discovered[@]}")
-      return
-    fi
-  done
-}
-
-# Discover a usable fan property (percent-like) from iLO output
-detect_fan_prop() {
-  local fan_sample="${FAN_IDS[0]}" prop=""
-  # Prefer explicit path under /system1 for the sample fan
-  local out
-  out=$(ssh_ilo "show /system1/$fan_sample" 2>/dev/null || ssh_ilo "show -a /system1/$fan_sample" 2>/dev/null || true)
-  if [[ -n "$out" ]]; then
-    prop=$(echo "$out" | tr -d '\r' | grep -iE 'speed|pwm|duty' | head -1 \
-      | sed -E 's/^[[:space:]]*([^:=[:space:]]+)[[:space:]]*[:=].*/\1/i' | tr '[:upper:]' '[:lower:]')
-    if [[ -n "$prop" ]]; then
-      echo "Detected fan property: $prop on /system1/$fan_sample" >&2
-      ILO_FAN_PROP="$prop"
-      return 0
-    fi
-  fi
-  # Try 'fans X show' where X is the numeric index extracted from fan name
-  if [[ "$fan_sample" =~ ^fan([0-9]+)$ ]]; then
-    local num=${BASH_REMATCH[1]}
-    out=$(ssh_ilo "fans $num show" 2>/dev/null || true)
-    if [[ -n "$out" ]]; then
-      prop=$(echo "$out" | tr -d '\r' | grep -iE 'speed|pwm|duty' | head -1 \
-        | sed -E 's/^[[:space:]]*([^:=[:space:]]+)[[:space:]]*[:=].*/\1/i' | tr '[:upper:]' '[:lower:]')
-      if [[ -n "$prop" ]]; then
-        echo "Detected fan property: $prop on fans $num show" >&2
-        ILO_FAN_PROP="$prop"
-        return 0
-      fi
-    fi
-  fi
-  for prefix in "${FAN_PATHS[@]}"; do
-    local out
-    out=$(ssh_ilo "show -a $prefix/$fan_sample" 2>/dev/null || ssh_ilo "show $prefix/$fan_sample" 2>/dev/null || true)
-    if [[ -z "$out" ]]; then continue; fi
-    # Look for key=value style fields with names containing speed/pwm/duty
-    prop=$(echo "$out" | tr -d '\r' | grep -iE 'speed|pwm|duty' | head -1 \
-      | sed -E 's/^[[:space:]]*([^:=[:space:]]+)[[:space:]]*[:=].*/\1/i' | tr '[:upper:]' '[:lower:]')
-    if [[ -n "$prop" ]]; then
-      echo "Detected fan property: $prop on $prefix/$fan_sample" >&2
-      ILO_FAN_PROP="$prop"
-      return 0
-    fi
-  done
-  return 1
-}
-
-# Validate that first fan is queryable; otherwise try to discover
-if ! ssh_ilo "show /system1/${FAN_IDS[0]}" >/dev/null 2>&1 && ! ssh_ilo "show /system1/fans1/${FAN_IDS[0]}" >/dev/null 2>&1; then
-  auto_discover_fans
-fi
-if [[ -z "$ILO_FAN_PROP" ]]; then
-  detect_fan_prop || true
-fi
+# Note: We avoid 'show' and 'fans show' for discovery or detection to reduce iLO load.
 
 CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
 MAX_STEP="${MAX_STEP:-10}"
@@ -239,9 +174,8 @@ get_cpu_temp() {
       return
     fi
   fi
-  # Fallback to iLO sensors over SSH; prefer values with trailing C
-  ssh_ilo "show /system1/sensors" \
-    | grep -Ei 'cpu|proc|processor' \
+  # Fallback to iLO sensor2 over SSH (CPU temp)
+  ssh_ilo "show /system1/sensor2" \
     | sed -n -E 's/.*([0-9]{1,3})[ ]*[Cc]?.*/\1/p' \
     | sort -nr | head -1
 }
@@ -343,9 +277,15 @@ apply_fan_speed() {
       local v255=$(( (NEW * 255 + 50) / 100 ))
       (( v255 < 1 )) && v255=1
       (( v255 > 255 )) && v255=255
-      # Append to current chunk (max then min)
-      chunk_cmd+="fan p $fan_id max $v255; fan p $fan_id min $v255; "
-      ((chunk_count++))
+      # Skip unchanged to avoid spamming iLO
+      if (( NEW != CURRENT )); then
+        # min is 8 steps below max (clamped)
+        local vmin=$(( v255 - 8 ))
+        (( vmin < 1 )) && vmin=1
+        # Append to current chunk (max then min)
+        chunk_cmd+="fan p $fan_id max $v255; fan p $fan_id min $vmin; "
+        ((chunk_count++))
+      fi
       # Send when chunk full
       if (( chunk_count >= ILO_BATCH_SIZE )); then
         if ! ssh_ilo "$chunk_cmd" >/dev/null 2>&1; then
@@ -383,12 +323,14 @@ apply_fan_speed() {
     # Clamp to [0,100]
     (( NEW < 0 )) && NEW=0
     (( NEW > 100 )) && NEW=100
-    if ! ilo_set_speed "$fan" "$NEW"; then
-      echo "WARN: Failed to set $fan to $NEW" >&2
+    if (( NEW != CURRENT )); then
+      if ! ilo_set_speed "$fan" "$NEW"; then
+        echo "WARN: Failed to set $fan to $NEW" >&2
+      fi
+      # separation between per-fan sets only when we send a command
+      sleep_ms "$ILO_CMD_GAP_MS"
+      LAST_SPEEDS[$fan]=$NEW
     fi
-    # separation between per-fan sets
-    sleep_ms "$ILO_CMD_GAP_MS"
-    LAST_SPEEDS[$fan]=$NEW
     done
   fi
   # Save current speeds

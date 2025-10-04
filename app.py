@@ -419,6 +419,7 @@ def ilo_set_speed_percent_modded(pid: int, percent: int) -> bool:
     """Set exact fan min=max in 1..255 domain for modded iLO."""
     v = max(0, min(100, int(percent)))
     v255 = max(1, min(255, (v * 255 + 50) // 100))
+    vmin = max(1, v255 - 8)  # min 8 steps below max to avoid iLO quirks
     ok = True
     try:
         _ilo_run(f"fan p {pid} max {v255}")
@@ -427,7 +428,7 @@ def ilo_set_speed_percent_modded(pid: int, percent: int) -> bool:
     try:
         # small delay to help iLO apply sequentially
         time.sleep(0.1)
-        _ilo_run(f"fan p {pid} min {v255}")
+        _ilo_run(f"fan p {pid} min {vmin}")
     except Exception:
         ok = False
     return ok
@@ -450,10 +451,10 @@ def get_temps():
             cpu_temp = ""
     if not cpu_temp:
         try:
-            sensors = _ilo_run("show /system1/sensors")
-            # Extract biggest integer on lines mentioning CPU/Proc
-            awk = r"awk 'tolower($0) ~ /cpu|proc|processor/ { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) print $i }' | sort -nr | head -1"
-            cpu_temp = subprocess.check_output(awk, input=sensors, shell=True, text=True).strip()
+            # iLO CPU temp is typically under /system1/sensor2
+            out = _ilo_run("show /system1/sensor2")
+            m = re.search(r"\b(\d{1,3})\b", out)
+            cpu_temp = m.group(1) if m else ""
         except Exception:
             cpu_temp = ""
     # GPU via nvidia-smi
@@ -523,16 +524,13 @@ def status():
                 if len(sensors) >= 5:
                     break
         else:
-            stext = _ilo_run("show /system1/sensors")
-            for line in stext.splitlines():
-                if 'CPU' in line:
-                    continue
-                if any(k in line.lower() for k in ['temp','ambient','inlet','pci','chipset','vr','dimm','io board','controller']):
-                    m = re.search(r"\b(\d{1,3})\b", line)
-                    if m:
-                        sensors.append({"label": line.strip()[:30], "value": m.group(1)})
-                if len(sensors) >= 5:
-                    break
+            try:
+                stext = _ilo_run("show /system1/sensor2")
+                m = re.search(r"\b(\d{1,3})\b", stext)
+                if m:
+                    sensors.append({"label": "CPU (sensor2)", "value": m.group(1)})
+            except Exception:
+                pass
     except Exception:
         sensors = []
 
