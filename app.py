@@ -1,11 +1,13 @@
 from flask import Flask, render_template, request, redirect, jsonify
 import json, os, subprocess, re, time, threading, shutil
+from collections import deque
 
 app = Flask(__name__)
 
 # Default to server install paths; can be overridden by env
 FAN_CURVE_FILE = os.getenv("FAN_CURVE_FILE", "/opt/dynamic-fan-ui/fan_curve.json")
 FAN_SPEED_FILE = os.getenv("FAN_SPEED_FILE", "/opt/dynamic-fan-ui/fan_speeds.txt")
+UI_CONFIG_FILE = os.getenv("UI_CONFIG_FILE", "/opt/dynamic-fan-ui/ui_config.json")
 FAN_IDS = ["fan1", "fan2", "fan3", "fan4", "fan5"]
 # Allow override via env string: FAN_IDS_STR="fan2 fan3 fan4"
 _ids_env = os.getenv("FAN_IDS_STR", "").strip()
@@ -26,6 +28,14 @@ except Exception:
     ILO_PID_OFFSET = -1
 ILO_FAN_PROP = os.getenv("ILO_FAN_PROP", "")
 ILO_SSH_TTY = os.getenv("ILO_SSH_TTY", "1") == "1"  # some iLO shells require a TTY
+try:
+    ILO_SSH_TIMEOUT = int(os.getenv("ILO_SSH_TIMEOUT", "12"))
+except Exception:
+    ILO_SSH_TIMEOUT = 12
+try:
+    ILO_SSH_PERSIST = int(os.getenv("ILO_SSH_PERSIST", "60"))  # seconds to keep control connection alive
+except Exception:
+    ILO_SSH_PERSIST = 60
 
 # iLO fan object search paths and property candidates
 FAN_PATHS = ["/system1", "/system1/fans1"]
@@ -99,7 +109,14 @@ def get_fan_speeds():
 
 
 def _build_ssh_base():
-    base = ["ssh", "-o", "StrictHostKeyChecking=no"]
+    base = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        # Reuse a control connection to avoid per-command handshake overhead
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPath=/tmp/ssh-ilo-%C",
+        "-o", f"ControlPersist={ILO_SSH_PERSIST}",
+    ]
     if ILO_SSH_LEGACY:
         base += [
             "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1",
@@ -122,18 +139,69 @@ _DISCOVERED_FANS: list[str] | None = None
 _DETECTED_PROP: str | None = None
 _DETECTED_PATH: str | None = None
 _COMPUTED_PIDS: list[int] | None = None
+_ILO_RECENT = deque(maxlen=200)
 
 
-def _ilo_run(cmd: str, timeout: int = 4) -> str:
+def _load_ui_config():
+    try:
+        if os.path.exists(UI_CONFIG_FILE):
+            with open(UI_CONFIG_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _apply_ui_overrides(cfg: dict | None = None):
+    global ILO_SSH_LEGACY, ILO_SSH_TTY, ILO_SSH_TIMEOUT, ILO_SSH_PERSIST
+    global ILO_MODDED, ILO_PID_OFFSET, _EXPLICIT_PIDS, ILO_FAN_PROP
+    if cfg is None:
+        cfg = _load_ui_config()
+    if not isinstance(cfg, dict):
+        return
+    try:
+        if "ILO_SSH_LEGACY" in cfg:
+            ILO_SSH_LEGACY = bool(int(cfg["ILO_SSH_LEGACY"]))
+        if "ILO_SSH_TTY" in cfg:
+            ILO_SSH_TTY = bool(int(cfg["ILO_SSH_TTY"]))
+        if "ILO_SSH_TIMEOUT" in cfg:
+            ILO_SSH_TIMEOUT = int(cfg["ILO_SSH_TIMEOUT"])
+        if "ILO_SSH_PERSIST" in cfg:
+            ILO_SSH_PERSIST = int(cfg["ILO_SSH_PERSIST"])
+        if "ILO_MODDED" in cfg:
+            ILO_MODDED = bool(int(cfg["ILO_MODDED"]))
+        if "ILO_PID_OFFSET" in cfg:
+            ILO_PID_OFFSET = int(cfg["ILO_PID_OFFSET"])
+        if "FAN_P_IDS_STR" in cfg:
+            s = str(cfg["FAN_P_IDS_STR"]).strip()
+            _EXPLICIT_PIDS = [int(x) for x in s.split() if x.isdigit()] if s else []
+        if "ILO_FAN_PROP" in cfg:
+            ILO_FAN_PROP = str(cfg["ILO_FAN_PROP"]).strip()
+    except Exception:
+        pass
+
+
+# Apply any stored overrides on startup
+_apply_ui_overrides()
+
+
+def _ilo_run(cmd: str, timeout: int | None = None) -> str:
+    if timeout is None:
+        timeout = ILO_SSH_TIMEOUT
     base = _build_ssh_base()
     ssh_cmd = base + [f"{ILO_USER}@{ILO_IP}", cmd]
     if ILO_PASSWORD:
         ssh_cmd = ["sshpass", "-p", ILO_PASSWORD] + ssh_cmd
     # Merge stderr for better diagnostics
+    t0 = time.time()
     res = subprocess.run(ssh_cmd, text=True, timeout=timeout, capture_output=True)
     if res.returncode != 0:
-        raise subprocess.CalledProcessError(res.returncode, ssh_cmd, output=res.stdout + res.stderr)
-    return res.stdout
+        err = (res.stdout or "") + (res.stderr or "")
+        _ILO_RECENT.append({"ts": time.time(), "cmd": cmd, "rc": res.returncode, "ms": int((time.time()-t0)*1000), "out": err[-2000:]})
+        raise subprocess.CalledProcessError(res.returncode, ssh_cmd, output=err)
+    out = res.stdout or ""
+    _ILO_RECENT.append({"ts": time.time(), "cmd": cmd, "rc": 0, "ms": int((time.time()-t0)*1000), "out": (out + (res.stderr or ""))[-2000:]})
+    return out
 
 
 def _discover_fans() -> list[str]:
@@ -296,11 +364,7 @@ def get_temps():
             cpu_temp = ""
     if not cpu_temp:
         try:
-            base = _build_ssh_base()
-            ssh_cmd = base + [f"{ILO_USER}@{ILO_IP}", "show /system1/sensors"]
-            if ILO_PASSWORD:
-                ssh_cmd = ["sshpass", "-p", ILO_PASSWORD] + ssh_cmd
-            sensors = subprocess.check_output(ssh_cmd, text=True, timeout=3)
+            sensors = _ilo_run("show /system1/sensors")
             # Extract biggest integer on lines mentioning CPU/Proc
             awk = r"awk 'tolower($0) ~ /cpu|proc|processor/ { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) print $i }' | sort -nr | head -1"
             cpu_temp = subprocess.check_output(awk, input=sensors, shell=True, text=True).strip()
@@ -330,12 +394,24 @@ def get_temps():
 
 @app.route("/")
 def index():
+    # Provide current settings for UI
+    settings = {
+        "ILO_SSH_LEGACY": 1 if ILO_SSH_LEGACY else 0,
+        "ILO_SSH_TTY": 1 if ILO_SSH_TTY else 0,
+        "ILO_SSH_TIMEOUT": ILO_SSH_TIMEOUT,
+        "ILO_SSH_PERSIST": ILO_SSH_PERSIST,
+        "ILO_MODDED": 1 if ILO_MODDED else 0,
+        "ILO_PID_OFFSET": ILO_PID_OFFSET,
+        "FAN_P_IDS_STR": " ".join(str(x) for x in _EXPLICIT_PIDS) if _EXPLICIT_PIDS else "",
+        "ILO_FAN_PROP": ILO_FAN_PROP or "",
+    }
     return render_template(
         "index.html",
         fan_curve=load_curve(),
         fan_speeds=get_fan_speeds(),
         cpu_temp="",
         gpu_temp="",
+        settings=settings,
     )
 
 
@@ -359,11 +435,7 @@ def status():
                 if len(sensors) >= 5:
                     break
         else:
-            base = _build_ssh_base()
-            ssh_cmd = base + [f"{ILO_USER}@{ILO_IP}", "show /system1/sensors"]
-            if ILO_PASSWORD:
-                ssh_cmd = ["sshpass", "-p", ILO_PASSWORD] + ssh_cmd
-            stext = subprocess.check_output(ssh_cmd, text=True, timeout=3)
+            stext = _ilo_run("show /system1/sensors")
             for line in stext.splitlines():
                 if 'CPU' in line:
                     continue
@@ -621,9 +693,9 @@ def test_ilo():
         method = "sshpass"
     cmd += [f"{ILO_USER}@{ILO_IP}", "echo ok"]
     try:
-        out = subprocess.check_output(cmd, text=True, timeout=3).strip()
-        ok_flag = (out.lower().find("ok") != -1)
-        return jsonify({"ok": ok_flag, "method": method, "output": out})
+        out = _ilo_run("echo ok")
+        ok_flag = (out.strip().lower().find("ok") != -1)
+        return jsonify({"ok": ok_flag, "method": method, "output": out.strip()})
     except Exception as e:
         return jsonify({"ok": False, "method": method, "error": str(e)}), 500
 
@@ -641,6 +713,50 @@ def export_curve():
     except Exception:
         data = {}
     return jsonify(data)
+
+
+@app.route("/ilo_recent")
+def ilo_recent():
+    # Return recent iLO command interactions from the server side
+    arr = list(_ILO_RECENT)
+    for item in arr:
+        # Render timestamps as ISO-ish strings
+        item["time"] = time.strftime("%H:%M:%S", time.localtime(item.pop("ts", time.time())))
+    return jsonify(arr)
+
+
+@app.route("/settings", methods=["POST"])
+def update_settings():
+    # Server-side overrides; persists to UI_CONFIG_FILE and applies immediately to server use
+    cfg = _load_ui_config()
+    fields = [
+        "ILO_SSH_LEGACY", "ILO_SSH_TTY", "ILO_SSH_TIMEOUT", "ILO_SSH_PERSIST",
+        "ILO_MODDED", "ILO_PID_OFFSET", "FAN_P_IDS_STR", "ILO_FAN_PROP"
+    ]
+    for k in fields:
+        v = request.form.get(k)
+        if v is not None:
+            cfg[k] = v
+    try:
+        os.makedirs(os.path.dirname(UI_CONFIG_FILE), exist_ok=True)
+        with open(UI_CONFIG_FILE, "w") as f:
+            json.dump(cfg, f)
+    except Exception:
+        pass
+    _apply_ui_overrides(cfg)
+    return redirect("/")
+
+
+@app.route("/logs")
+def logs():
+    # Try to show last 80 lines of the daemon logs
+    try:
+        if shutil.which("journalctl"):
+            out = subprocess.check_output(["journalctl", "-u", "dynamic-fans.service", "-n", "80", "--no-pager"], text=True, timeout=5)
+            return jsonify({"ok": True, "text": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": False, "error": "journalctl not available"})
 
 
 @app.route("/test_ilo_control", methods=["POST"])

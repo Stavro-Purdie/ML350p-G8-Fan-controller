@@ -16,6 +16,8 @@ ILO_MODDED="${ILO_MODDED:-0}"
 ILO_PID_OFFSET="${ILO_PID_OFFSET:--1}"
 ILO_SSH_TTY="${ILO_SSH_TTY:-1}"
 VERBOSE="${VERBOSE:-0}"
+ILO_SSH_TIMEOUT="${ILO_SSH_TIMEOUT:-12}"
+ILO_SSH_PERSIST="${ILO_SSH_PERSIST:-60}"
 
 FAN_IDS=("fan1" "fan2" "fan3" "fan4" "fan5")
 # Allow overriding the base path(s) to fan objects
@@ -104,6 +106,10 @@ mkdir -p "$(dirname "$FAN_SPEED_FILE")" "$(dirname "$FAN_CURVE_FILE")"
 
 # Build SSH helper
 SSH_OPTS=("-o" "StrictHostKeyChecking=no")
+# Apply ConnectTimeout and keep-alives
+SSH_OPTS+=("-o" "ConnectTimeout=${ILO_SSH_TIMEOUT}" "-o" "ServerAliveInterval=5" "-o" "ServerAliveCountMax=2")
+# Reuse a control connection to avoid per-command handshake overhead
+SSH_OPTS+=("-o" "ControlMaster=auto" "-o" "ControlPath=/tmp/ssh-ilo-%C" "-o" "ControlPersist=${ILO_SSH_PERSIST}")
 if [[ -n "$ILO_SSH_KEY" && -f "$ILO_SSH_KEY" ]]; then
   SSH_OPTS+=("-i" "$ILO_SSH_KEY")
 fi
@@ -139,6 +145,11 @@ ssh_ilo() {
   printf "%s" "$output"
   return $rc
 }
+
+# Optionally prewarm a control connection to reduce first-call latency
+if [[ "${PREWARM:-1}" == "1" ]]; then
+  ssh_ilo "echo prewarm" >/dev/null 2>&1 || true
+fi
 
 # Load previous fan speeds if available
 if [[ -f "$FAN_SPEED_FILE" ]]; then
