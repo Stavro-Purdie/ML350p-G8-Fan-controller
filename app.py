@@ -451,9 +451,9 @@ def get_temps():
             cpu_temp = ""
     if not cpu_temp:
         try:
-            # iLO CPU temp is typically under /system1/sensor2
+            # iLO CPU temp is typically under /system1/sensor2, parse CurrentReading
             out = _ilo_run("show /system1/sensor2")
-            m = re.search(r"\b(\d{1,3})\b", out)
+            m = re.search(r"CurrentReading\s*=\s*(\d{1,3})", out, re.IGNORECASE)
             cpu_temp = m.group(1) if m else ""
         except Exception:
             cpu_temp = ""
@@ -526,7 +526,7 @@ def status():
         else:
             try:
                 stext = _ilo_run("show /system1/sensor2")
-                m = re.search(r"\b(\d{1,3})\b", stext)
+                m = re.search(r"CurrentReading\s*=\s*(\d{1,3})", stext, re.IGNORECASE)
                 if m:
                     sensors.append({"label": "CPU (sensor2)", "value": m.group(1)})
             except Exception:

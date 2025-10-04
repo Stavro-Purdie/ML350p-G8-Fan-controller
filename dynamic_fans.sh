@@ -176,8 +176,9 @@ get_cpu_temp() {
   fi
   # Fallback to iLO sensor2 over SSH (CPU temp)
   ssh_ilo "show /system1/sensor2" \
-    | sed -n -E 's/.*([0-9]{1,3})[ ]*[Cc]?.*/\1/p' \
-    | sort -nr | head -1
+    | grep -i "^\s*CurrentReading=" \
+    | sed -n -E 's/.*CurrentReading=([0-9]{1,3}).*/\1/p' \
+    | head -1
 }
 
 get_gpu_temp() {
