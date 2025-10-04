@@ -14,6 +14,7 @@ USE_IPMI_TEMPS="${USE_IPMI_TEMPS:-0}"
 ILO_SSH_LEGACY="${ILO_SSH_LEGACY:-0}"
 ILO_MODDED="${ILO_MODDED:-0}"
 ILO_PID_OFFSET="${ILO_PID_OFFSET:--1}"
+ILO_SSH_TTY="${ILO_SSH_TTY:-1}"
 
 FAN_IDS=("fan1" "fan2" "fan3" "fan4" "fan5")
 # Allow overriding the base path(s) to fan objects
@@ -127,6 +128,10 @@ if [[ "$ILO_SSH_LEGACY" == "1" ]]; then
     "-o" "Ciphers=+aes128-cbc,3des-cbc"
     "-o" "MACs=+hmac-sha1"
   )
+fi
+# Some iLO shells behave better with a forced TTY (especially modded cmds)
+if [[ "$ILO_SSH_TTY" == "1" || "$ILO_MODDED" == "1" ]]; then
+  SSH_OPTS+=("-tt")
 fi
 ssh_ilo() {
   local cmd=$1
@@ -264,12 +269,13 @@ apply_fan_speed() {
       local v255=$(( (NEW * 255 + 50) / 100 ))
       (( v255 < 1 )) && v255=1
       (( v255 > 255 )) && v255=255
-      # Set exact control: min = max = v255
-      if ! ssh_ilo "fan p $fan_id min $v255" >/dev/null 2>&1; then
-        echo "WARN: Failed to set fan p $fan_id min=$v255" >&2
-      fi
+      # Set exact control: max first, then min = max = v255 (more reliable on some builds)
       if ! ssh_ilo "fan p $fan_id max $v255" >/dev/null 2>&1; then
         echo "WARN: Failed to set fan p $fan_id max=$v255" >&2
+      fi
+      sleep 0.1
+      if ! ssh_ilo "fan p $fan_id min $v255" >/dev/null 2>&1; then
+        echo "WARN: Failed to set fan p $fan_id min=$v255" >&2
       fi
       LAST_SPEEDS[$fan]=$NEW
     done

@@ -13,12 +13,12 @@
   <h1>HP ML350p Gen8 Fan Dashboard</h1>
 
   <div>
-    <p>CPU Temp: <strong>{{ cpu_temp }}</strong> °C</p>
-    <p>GPU Temp: <strong>{{ gpu_temp }}</strong> °C</p>
+    <p>CPU Temp: <strong id="cpu">{{ cpu_temp }}</strong> °C</p>
+    <p>GPU Temp: <strong id="gpu">{{ gpu_temp }}</strong> °C <span id="gpu_name"></span> <span id="gpu_power"></span></p>
   </div>
 
   <h2>Fan Speeds</h2>
-  <ul class="meters">
+  <ul id="fan-speeds" class="meters">
     {% for s in fan_speeds %}<li>{{ s }}%</li>{% endfor %}
   </ul>
 
@@ -30,6 +30,35 @@
     <label>Max Temp: <input type="number" name="maxTemp" value="{{ fan_curve.maxTemp }}"> °C</label>
     <label>Min Speed: <input type="number" name="minSpeed" value="{{ fan_curve.minSpeed }}"> %</label>
     <label>Max Speed: <input type="number" name="maxSpeed" value="{{ fan_curve.maxSpeed }}"> %</label>
+    <fieldset style="margin-top:10px;">
+      <legend>GPU Curve (optional)</legend>
+      <label>GPU Min Temp: <input type="number" name="gpu_minTemp" value="{{ fan_curve.gpu.minTemp }}"> °C</label>
+      <label>GPU Max Temp: <input type="number" name="gpu_maxTemp" value="{{ fan_curve.gpu.maxTemp }}"> °C</label>
+      <label>GPU Min Speed: <input type="number" name="gpu_minSpeed" value="{{ fan_curve.gpu.minSpeed }}"> %</label>
+      <label>GPU Max Speed: <input type="number" name="gpu_maxSpeed" value="{{ fan_curve.gpu.maxSpeed }}"> %</label>
+    </fieldset>
+    <fieldset style="margin-top:10px;">
+      <legend>Blending</legend>
+      <label>Mode:
+        <select name="blend_mode">
+          <option value="max" {% if fan_curve.blend.mode == 'max' %}selected{% endif %}>Max</option>
+          <option value="weighted" {% if fan_curve.blend.mode == 'weighted' %}selected{% endif %}>Weighted</option>
+        </select>
+      </label>
+      <label>CPU Weight: <input step="0.1" type="number" name="blend_cpuWeight" value="{{ fan_curve.blend.cpuWeight }}"></label>
+      <label>GPU Weight: <input step="0.1" type="number" name="blend_gpuWeight" value="{{ fan_curve.blend.gpuWeight }}"></label>
+    </fieldset>
+    <fieldset style="margin-top:10px;">
+      <legend>GPU Boost</legend>
+      <label>Threshold: <input type="number" name="gpuBoost_threshold" value="{{ fan_curve.gpuBoost.threshold }}"> °C</label>
+      <label>Add: <input type="number" name="gpuBoost_add" value="{{ fan_curve.gpuBoost.add }}"> %</label>
+    </fieldset>
+    <fieldset style="margin-top:10px;">
+      <legend>Runtime Tunables</legend>
+      <label>Check Interval: <input type="number" name="checkInterval" value="{{ fan_curve.checkInterval or '' }}"> s</label>
+      <label>Max Step: <input type="number" name="maxStep" value="{{ fan_curve.maxStep or '' }}"> %/tick</label>
+      <label>Min Change: <input type="number" name="minChange" value="{{ fan_curve.minChange or '' }}"> %</label>
+    </fieldset>
     <div style="margin-top:8px;"><button type="submit">Update Curve</button></div>
   </form>
 
@@ -54,6 +83,8 @@
   <p>
     <a href="/export_status" target="_blank">Download status JSON</a>
     • <a href="/export_curve" target="_blank">Download fan curve JSON</a>
+    • <a href="/test_ilo" target="_blank">Test iLO SSH</a>
+    • <a href="/debug_ilo_fans" target="_blank">Debug iLO Fans</a>
   </p>
 
   <h2>Other Sensors</h2>

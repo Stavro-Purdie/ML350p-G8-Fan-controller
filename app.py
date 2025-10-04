@@ -25,6 +25,7 @@ try:
 except Exception:
     ILO_PID_OFFSET = -1
 ILO_FAN_PROP = os.getenv("ILO_FAN_PROP", "")
+ILO_SSH_TTY = os.getenv("ILO_SSH_TTY", "1") == "1"  # some iLO shells require a TTY
 
 # iLO fan object search paths and property candidates
 FAN_PATHS = ["/system1", "/system1/fans1"]
@@ -110,6 +111,8 @@ def _build_ssh_base():
         ]
     if ILO_SSH_KEY and os.path.exists(ILO_SSH_KEY):
         base += ["-i", ILO_SSH_KEY]
+    if ILO_SSH_TTY or ILO_MODDED:
+        base += ["-tt"]
     return base
 
 
@@ -126,7 +129,11 @@ def _ilo_run(cmd: str, timeout: int = 4) -> str:
     ssh_cmd = base + [f"{ILO_USER}@{ILO_IP}", cmd]
     if ILO_PASSWORD:
         ssh_cmd = ["sshpass", "-p", ILO_PASSWORD] + ssh_cmd
-    return subprocess.check_output(ssh_cmd, text=True, timeout=timeout)
+    # Merge stderr for better diagnostics
+    res = subprocess.run(ssh_cmd, text=True, timeout=timeout, capture_output=True)
+    if res.returncode != 0:
+        raise subprocess.CalledProcessError(res.returncode, ssh_cmd, output=res.stdout + res.stderr)
+    return res.stdout
 
 
 def _discover_fans() -> list[str]:
@@ -260,11 +267,13 @@ def ilo_set_speed_percent_modded(pid: int, percent: int) -> bool:
     v255 = max(1, min(255, (v * 255 + 50) // 100))
     ok = True
     try:
-        _ilo_run(f"fan p {pid} min {v255}")
+        _ilo_run(f"fan p {pid} max {v255}")
     except Exception:
         ok = False
     try:
-        _ilo_run(f"fan p {pid} max {v255}")
+        # small delay to help iLO apply sequentially
+        time.sleep(0.1)
+        _ilo_run(f"fan p {pid} min {v255}")
     except Exception:
         ok = False
     return ok
@@ -396,10 +405,41 @@ def status():
     except Exception:
         gpu_info = []
 
+    # NVENC sessions (best-effort, may require supported driver)
+    try:
+        enc = subprocess.check_output(
+            "nvidia-smi encodersessions -q 2>/dev/null | cat",
+            shell=True, text=True, timeout=3
+        )
+        # Count sessions per bus id
+        current_bus = None
+        counts = {}
+        for line in enc.splitlines():
+            m = re.search(r"GPU\s+([0-9a-fA-F:]+)", line)
+            if m:
+                current_bus = m.group(1)
+                counts.setdefault(current_bus, 0)
+            if "Session Id" in line and current_bus:
+                counts[current_bus] = counts.get(current_bus, 0) + 1
+        if counts and gpu_info:
+            for g in gpu_info:
+                g["encoder_sessions"] = counts.get(g.get("bus_id"), 0)
+    except Exception:
+        pass
+
+    # Service status (best-effort)
+    svc = {"present": False, "active": False}
+    try:
+        if shutil.which("systemctl"):
+            out = subprocess.check_output(["systemctl", "is-active", "dynamic-fans.service"], text=True, timeout=2).strip()
+            svc = {"present": True, "active": (out == "active")}
+    except Exception:
+        pass
+
     return jsonify({
         "cpu": cpu, "gpu": gpu, "gpu_name": gpu_name, "gpu_power": gpu_power,
         "fans": get_fan_speeds(), "sensors": sensors, "gpu_info": gpu_info,
-        "ok": True,
+        "service": svc, "ok": True,
     })
 
 
@@ -440,6 +480,19 @@ def update_curve():
         if t not in (None, ""): boost["threshold"] = int(t)
         if a not in (None, ""): boost["add"] = int(a)
         if boost: curve["gpuBoost"] = boost
+    except Exception:
+        pass
+    # Optional runtime tunables used by daemon
+    try:
+        ci = request.form.get("checkInterval")
+        ms = request.form.get("maxStep")
+        mc = request.form.get("minChange")
+        if ci not in (None, ""):
+            curve["checkInterval"] = int(ci)
+        if ms not in (None, ""):
+            curve["maxStep"] = int(ms)
+        if mc not in (None, ""):
+            curve["minChange"] = int(mc)
     except Exception:
         pass
     try:
@@ -494,6 +547,15 @@ def _run_quick_test(percent: int, duration: int):
                     ilo_set_speed_percent_normal(fan, percent)
                 except Exception:
                     continue
+        # Reflect immediately in speed file for UI
+        try:
+            speeds = [max(0, min(100, int(percent))) for _ in fans]
+            os.makedirs(os.path.dirname(FAN_SPEED_FILE), exist_ok=True)
+            with open(FAN_SPEED_FILE, "w") as f:
+                for s in speeds:
+                    f.write(str(s) + "\n")
+        except Exception:
+            pass
         # Hold for duration
         time.sleep(max(1, min(300, duration)))
         # Resume daemon which will take over speed management
@@ -557,6 +619,39 @@ def export_curve():
     except Exception:
         data = {}
     return jsonify(data)
+
+
+@app.route("/test_ilo_control", methods=["POST"])
+def test_ilo_control():
+    """One-shot control test: set percent on either one fan (normal) or one PID (modded)."""
+    try:
+        percent = int(request.form.get("percent", "50"))
+    except Exception:
+        percent = 50
+    target = request.form.get("target", "0")  # index of fan or pid
+    result = {"ok": False, "percent": percent}
+    try:
+        if ILO_MODDED:
+            fans = _discover_fans()
+            pids = _compute_pids(fans)
+            idx = int(target) if str(target).isdigit() else 0
+            if idx < 0 or idx >= len(pids):
+                idx = 0
+            pid = pids[idx]
+            ok = ilo_set_speed_percent_modded(pid, percent)
+            result.update({"mode": "modded", "pid": pid, "fan_index": idx, "ok": ok})
+        else:
+            fans = _discover_fans()
+            idx = int(target) if str(target).isdigit() else 0
+            if idx < 0 or idx >= len(fans):
+                idx = 0
+            fan = fans[idx]
+            ok = ilo_set_speed_percent_normal(fan, percent)
+            result.update({"mode": "normal", "fan": fan, "fan_index": idx, "ok": ok})
+    except Exception as e:
+        result.update({"error": str(e)})
+        return jsonify(result), 500
+    return jsonify(result)
 
 
 @app.route("/debug_ilo_fans")
