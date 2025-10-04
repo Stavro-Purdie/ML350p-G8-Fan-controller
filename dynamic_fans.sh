@@ -218,6 +218,8 @@ calc_targets() {
 
 apply_fan_speed() {
   local target=$1
+  local updates_sent=0
+  local updated_pids=()
   # Helper to set speed with path fallbacks
   ilo_set_speed() {
     local fan=$1 val=$2
@@ -286,6 +288,8 @@ apply_fan_speed() {
         # Append to current chunk (max then min)
         chunk_cmd+="fan p $fan_id max $v255; fan p $fan_id min $vmin; "
         ((chunk_count++))
+        ((updates_sent++))
+        updated_pids+=("$fan_id")
       fi
       # Send when chunk full
       if (( chunk_count >= ILO_BATCH_SIZE )); then
@@ -331,8 +335,16 @@ apply_fan_speed() {
       # separation between per-fan sets only when we send a command
       sleep_ms "$ILO_CMD_GAP_MS"
       LAST_SPEEDS[$fan]=$NEW
+      ((updates_sent++))
     fi
     done
+  fi
+  if [[ "$VERBOSE" == "1" ]]; then
+    if [[ "$ILO_MODDED" == "1" ]]; then
+      echo "[loop] updates_sent=$updates_sent pids=[${updated_pids[*]}]" >&2
+    else
+      echo "[loop] updates_sent=$updates_sent" >&2
+    fi
   fi
   # Save current speeds
   for fan in "${FAN_IDS[@]}"; do

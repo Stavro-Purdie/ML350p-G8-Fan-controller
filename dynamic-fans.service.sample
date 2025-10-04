@@ -12,6 +12,8 @@ Environment=ILO_SSH_LEGACY=1 ILO_SSH_TTY=1
 Environment=ILO_MODDED=1 ILO_PID_OFFSET=-1
 Environment=FAN_SPEED_FILE=/opt/dynamic-fan-ui/fan_speeds.txt FAN_CURVE_FILE=/opt/dynamic-fan-ui/fan_curve.json
 Environment=USE_IPMI_TEMPS=0 VERBOSE=1
+# Tip: Set VERBOSE=1 to log each SSH command and per-loop update counts.
+# View logs: journalctl -u dynamic-fans.service -n 100 --no-pager
 # Example explicit PID mapping instead of offset:
 # Environment=FAN_P_IDS_STR=1 2 3 4 5
 
