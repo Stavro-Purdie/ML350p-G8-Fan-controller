@@ -3,12 +3,9 @@
 <head>
   <meta charset="utf-8">
   <title>Dynamic Fan Control</title>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
-    .meters { list-style: none; padding: 0; display: flex; gap: 8px; }
-    .meters li { background: #eee; border: 1px solid #ccc; padding: 6px 10px; border-radius: 4px; min-width: 40px; text-align: center; }
-    label { display:block; margin-top: 6px; }
-  </style>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="/static/script.js"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" href="data:,">
 </head>
@@ -25,6 +22,8 @@
     {% for s in fan_speeds %}<li>{{ s }}%</li>{% endfor %}
   </ul>
 
+  <div id="health" style="padding:8px; background:#eef; border:1px solid #ccd; margin:10px 0; display:none;"></div>
+
   <h2>Fan Curve</h2>
   <form method="post" action="/update_curve">
     <label>Min Temp: <input type="number" name="minTemp" value="{{ fan_curve.minTemp }}"> °C</label>
@@ -39,6 +38,40 @@
     <button name="action" value="start">Start</button>
     <button name="action" value="stop">Stop</button>
   </form>
+
+  <h3>Fan Test</h3>
+  <form method="post" action="/fan_test" style="margin-top:8px;">
+    Percent: <input type="number" name="test_percent" min="0" max="100" value="100" style="width:70px;"> %
+    Duration: <input type="number" name="test_duration" min="1" max="60" value="10" style="width:70px;"> s
+    <button type="submit">Run Test</button>
+    <small style="color:#555;">Temporarily pauses control service.</small>
+  </form>
+
+  <h2>History</h2>
+  <canvas id="tempChart" height="100"></canvas>
+  <canvas id="fanChart" height="100"></canvas>
+
+  <p>
+    <a href="/export_status" target="_blank">Download status JSON</a>
+    • <a href="/export_curve" target="_blank">Download fan curve JSON</a>
+  </p>
+
+  <h2>Other Sensors</h2>
+  <table id="sensors" border="1" cellpadding="4" cellspacing="0">
+    <thead><tr><th>Sensor</th><th>Value (°C)</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>GPU Info</h2>
+  <table id="gpuinfo" border="1" cellpadding="4" cellspacing="0">
+    <thead>
+      <tr>
+        <th>Idx</th><th>Name</th><th>Bus</th><th>Temp</th><th>Util</th><th>Enc/Dec</th>
+        <th>Mem</th><th>Power</th><th>PState</th><th>Clocks</th><th>PCIe</th><th>NVENC Sessions</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 
 </body>
 </html>
