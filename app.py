@@ -124,8 +124,20 @@ def test_ilo():
 
 def get_fan_speeds():
     if os.path.exists(FAN_SPEED_FILE):
+        vals = []
         with open(FAN_SPEED_FILE) as f:
-            return [int(x.strip()) for x in f.readlines()]
+            for line in f:
+                s = line.strip()
+                try:
+                    vals.append(int(s))
+                except Exception:
+                    vals.append(0)
+        # Pad or trim to match configured fan count
+        if len(vals) < len(FAN_IDS):
+            vals += [0] * (len(FAN_IDS) - len(vals))
+        else:
+            vals = vals[:len(FAN_IDS)]
+        return vals
     return [0]*len(FAN_IDS)
 
 # Build SSH base for iLO commands

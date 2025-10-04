@@ -170,9 +170,8 @@ get_cpu_temp() {
       # Read highest CPU temperature via SDRs; prefer values with trailing C or 'degrees C'
       ipmitool -I lanplus -H "$ILO_IP" -U "$ILO_USER" ${ILO_PASSWORD:+-P "$ILO_PASSWORD"} sdr type Temperature \
         | awk '
-          tolower($0) ~ /cpu|proc|processor/ {
-            if (match(tolower($0), /([0-9]+)[[:space:]]*degrees?[[:space:]]*c/, m)) { print m[1]; }
-            else if (match(tolower($0), /([0-9]+)c/, m)) { print m[1]; }
+          ($0 ~ /[Cc][Pp][Uu]|[Pp]roc|[Pp]rocessor/) {
+            if (match($0, /([0-9]+)[ ]*[Cc]/, m)) { print m[1]; }
             else if (match($0, /([0-9]+)/, m)) { print m[1]; }
           }
         ' | sort -nr | head -1
@@ -181,8 +180,8 @@ get_cpu_temp() {
   fi
   # Fallback to iLO sensors over SSH; prefer values with trailing C
   ssh_ilo "show /system1/sensors" | awk '
-    tolower($0) ~ /cpu|proc|processor/ {
-      if (match(tolower($0), /([0-9]+)c/, m)) { print m[1]; }
+    ($0 ~ /[Cc][Pp][Uu]|[Pp]roc|[Pp]rocessor/) {
+      if (match($0, /([0-9]+)[ ]*[Cc]/, m)) { print m[1]; }
       else {
         for (i=1;i<=NF;i++) if (match($i, /^([0-9]+)$/, n)) print n[1];
       }
