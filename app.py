@@ -7,6 +7,10 @@ app = Flask(__name__)
 FAN_CURVE_FILE = os.getenv("FAN_CURVE_FILE", "/opt/dynamic-fan-ui/fan_curve.json")
 FAN_SPEED_FILE = os.getenv("FAN_SPEED_FILE", "/opt/dynamic-fan-ui/fan_speeds.txt")
 FAN_IDS = ["fan1", "fan2", "fan3", "fan4", "fan5"]
+# Allow override via env string: FAN_IDS_STR="fan2 fan3 fan4"
+_ids_env = os.getenv("FAN_IDS_STR", "").strip()
+if _ids_env:
+    FAN_IDS = [x for x in _ids_env.split() if x]
 
 # iLO/IPMI/GPU environment toggles (optional)
 ILO_SSH_KEY = os.getenv("ILO_SSH_KEY", "/root/.ssh/ilo_key")
@@ -15,6 +19,20 @@ ILO_IP = os.getenv("ILO_IP", "192.168.1.100")
 ILO_PASSWORD = os.getenv("ILO_PASSWORD", "")
 USE_IPMI_TEMPS = os.getenv("USE_IPMI_TEMPS", "0") == "1"
 ILO_SSH_LEGACY = os.getenv("ILO_SSH_LEGACY", "0") == "1"
+ILO_MODDED = os.getenv("ILO_MODDED", "0") == "1"
+try:
+    ILO_PID_OFFSET = int(os.getenv("ILO_PID_OFFSET", "-1"))
+except Exception:
+    ILO_PID_OFFSET = -1
+ILO_FAN_PROP = os.getenv("ILO_FAN_PROP", "")
+
+# iLO fan object search paths and property candidates
+FAN_PATHS = ["/system1", "/system1/fans1"]
+PROP_CANDIDATES = ["speed", "pwm", "duty", "duty_cycle", "fan_speed", "percentage"]
+
+# Optional explicit P-IDs for modded iLO: FAN_P_IDS_STR="1 2 3 4 5"
+_pids_env = os.getenv("FAN_P_IDS_STR", "").strip()
+_EXPLICIT_PIDS = [int(x) for x in _pids_env.split() if x.isdigit()] if _pids_env else []
 
 
 def load_curve():
@@ -93,6 +111,163 @@ def _build_ssh_base():
     if ILO_SSH_KEY and os.path.exists(ILO_SSH_KEY):
         base += ["-i", ILO_SSH_KEY]
     return base
+
+
+# ---------------- iLO helpers: discovery and control ----------------
+_detect_lock = threading.Lock()
+_DISCOVERED_FANS: list[str] | None = None
+_DETECTED_PROP: str | None = None
+_DETECTED_PATH: str | None = None
+_COMPUTED_PIDS: list[int] | None = None
+
+
+def _ilo_run(cmd: str, timeout: int = 4) -> str:
+    base = _build_ssh_base()
+    ssh_cmd = base + [f"{ILO_USER}@{ILO_IP}", cmd]
+    if ILO_PASSWORD:
+        ssh_cmd = ["sshpass", "-p", ILO_PASSWORD] + ssh_cmd
+    return subprocess.check_output(ssh_cmd, text=True, timeout=timeout)
+
+
+def _discover_fans() -> list[str]:
+    global _DISCOVERED_FANS
+    with _detect_lock:
+        if _DISCOVERED_FANS is not None:
+            return _DISCOVERED_FANS
+        found: list[str] = []
+        for p in FAN_PATHS:
+            try:
+                out = _ilo_run(f"show {p}")
+            except Exception:
+                continue
+            # Find tokens like fan1 fan2
+            tokens = re.findall(r"\bfan\d+\b", out)
+            if tokens:
+                found = sorted(set(tokens), key=lambda x: int(re.findall(r"\d+", x)[0]))
+                _DISCOVERED_FANS = found
+                return found
+        # fallback to configured list
+        _DISCOVERED_FANS = FAN_IDS[:]
+        return _DISCOVERED_FANS
+
+
+def _detect_fan_prop() -> tuple[str | None, str | None]:
+    """Return (prop, path) to use for normal iLO percent setting, or (None,None)."""
+    global _DETECTED_PROP, _DETECTED_PATH
+    with _detect_lock:
+        if _DETECTED_PROP is not None and _DETECTED_PATH is not None:
+            return _DETECTED_PROP, _DETECTED_PATH
+        # If user provided override, probe to confirm works on first fan
+        fans = _discover_fans()
+        sample = fans[0] if fans else "fan1"
+        if ILO_FAN_PROP:
+            for prefix in FAN_PATHS:
+                try:
+                    # Attempt a no-op show to ensure path exists
+                    _ilo_run(f"show {prefix}/{sample}")
+                    _DETECTED_PROP, _DETECTED_PATH = ILO_FAN_PROP, prefix
+                    return _DETECTED_PROP, _DETECTED_PATH
+                except Exception:
+                    continue
+        # Otherwise attempt to read attributes and infer
+        for prefix in FAN_PATHS:
+            try:
+                out = _ilo_run(f"show -a {prefix}/{sample}")
+            except Exception:
+                try:
+                    out = _ilo_run(f"show {prefix}/{sample}")
+                except Exception:
+                    continue
+            # Look for key=value with candidate names and plausible 0..100 values
+            for line in out.splitlines():
+                if '=' in line or ':' in line:
+                    parts = re.split(r"[:=]", line, maxsplit=1)
+                    if len(parts) < 2:
+                        continue
+                    key = parts[0].strip().lower()
+                    if any(k in key for k in ("speed", "pwm", "duty")):
+                        m = re.search(r"\b(\d{1,3})\b", parts[1])
+                        if m:
+                            v = int(m.group(1))
+                            if 0 <= v <= 100:
+                                _DETECTED_PROP, _DETECTED_PATH = key, prefix
+                                return _DETECTED_PROP, _DETECTED_PATH
+            # As a fallback, try known candidates
+            for prop in PROP_CANDIDATES:
+                try:
+                    # Try a harmless set to the same value if we can read one
+                    out = _ilo_run(f"show {prefix}/{sample}")
+                    m = re.search(r"\b(\d{1,3})\b", out)
+                    if not m:
+                        continue
+                    v = int(m.group(1))
+                    _ilo_run(f"set {prefix}/{sample} {prop}={v}")
+                    _DETECTED_PROP, _DETECTED_PATH = prop, prefix
+                    return _DETECTED_PROP, _DETECTED_PATH
+                except Exception:
+                    continue
+        return None, None
+
+
+def _compute_pids(fans: list[str]) -> list[int]:
+    global _COMPUTED_PIDS
+    with _detect_lock:
+        if _COMPUTED_PIDS is not None:
+            return _COMPUTED_PIDS
+        if _EXPLICIT_PIDS:
+            _COMPUTED_PIDS = _EXPLICIT_PIDS
+            return _COMPUTED_PIDS
+        pids: list[int] = []
+        for f in fans:
+            m = re.search(r"(\d+)", f)
+            if m:
+                pid = int(m.group(1)) + (ILO_PID_OFFSET or 0)
+            else:
+                pid = 0
+            if pid < 0:
+                pid = 0
+            pids.append(pid)
+        _COMPUTED_PIDS = pids
+        return _COMPUTED_PIDS
+
+
+def ilo_set_speed_percent_normal(fan: str, percent: int) -> bool:
+    """Set percent via property on fan object."""
+    prop, path = _detect_fan_prop()
+    candidates = [prop] if prop else []
+    for c in PROP_CANDIDATES:
+        if c not in candidates:
+            candidates.append(c)
+    for pr in candidates:
+        for prefix in (path,)+tuple(p for p in FAN_PATHS if p != path):
+            if not prefix:
+                continue
+            try:
+                _ilo_run(f"set {prefix}/{fan} {pr}={percent}")
+                # Cache success
+                with _detect_lock:
+                    global _DETECTED_PROP, _DETECTED_PATH
+                    _DETECTED_PROP, _DETECTED_PATH = pr, prefix
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def ilo_set_speed_percent_modded(pid: int, percent: int) -> bool:
+    """Set exact fan min=max in 1..255 domain for modded iLO."""
+    v = max(0, min(100, int(percent)))
+    v255 = max(1, min(255, (v * 255 + 50) // 100))
+    ok = True
+    try:
+        _ilo_run(f"fan p {pid} min {v255}")
+    except Exception:
+        ok = False
+    try:
+        _ilo_run(f"fan p {pid} max {v255}")
+    except Exception:
+        ok = False
+    return ok
 
 
 def get_temps():
@@ -289,6 +464,7 @@ def control():
 _test_lock = threading.Lock()
 _test_running = False
 
+
 def _run_quick_test(percent: int, duration: int):
     global _test_running
     with _test_lock:
@@ -296,13 +472,31 @@ def _run_quick_test(percent: int, duration: int):
             return
         _test_running = True
     try:
-        # For now just stop the service briefly and restart (placeholder without direct iLO set)
+        # Stop control loop so it doesn't fight the test
         if shutil.which("systemctl"):
             try:
-                subprocess.check_output(["systemctl", "stop", "dynamic-fans.service"], text=True, timeout=4)
+                subprocess.check_output(["systemctl", "stop", "dynamic-fans.service"], text=True, timeout=6)
             except Exception:
                 pass
-        time.sleep(max(1, min(60, duration)))
+        # Discover fans and optionally P-IDs
+        fans = _discover_fans()
+        # Apply requested percent
+        if ILO_MODDED:
+            pids = _compute_pids(fans)
+            for pid in pids:
+                try:
+                    ilo_set_speed_percent_modded(pid, percent)
+                except Exception:
+                    continue
+        else:
+            for fan in fans:
+                try:
+                    ilo_set_speed_percent_normal(fan, percent)
+                except Exception:
+                    continue
+        # Hold for duration
+        time.sleep(max(1, min(300, duration)))
+        # Resume daemon which will take over speed management
         if shutil.which("systemctl"):
             subprocess.Popen(["systemctl", "start", "dynamic-fans.service"])  # resume
     finally:
@@ -363,6 +557,58 @@ def export_curve():
     except Exception:
         data = {}
     return jsonify(data)
+
+
+@app.route("/debug_ilo_fans")
+def debug_ilo_fans():
+    info = {
+        "ilo_ip": ILO_IP,
+        "ilo_user": ILO_USER,
+        "legacy": ILO_SSH_LEGACY,
+        "modded": ILO_MODDED,
+        "pid_offset": ILO_PID_OFFSET,
+        "fan_paths": FAN_PATHS,
+        "prop_candidates": PROP_CANDIDATES,
+        "env_prop": ILO_FAN_PROP or "",
+        "configured_fans": FAN_IDS,
+    }
+    # Connectivity
+    try:
+        out = _ilo_run("echo ok", timeout=3).strip()
+        info["ssh_ok"] = (out.lower().find("ok") != -1)
+    except Exception as e:
+        info["ssh_ok"] = False
+        info["ssh_error"] = str(e)
+    # Discovery
+    try:
+        fans = _discover_fans()
+        info["discovered_fans"] = fans
+    except Exception as e:
+        info["discovered_fans_error"] = str(e)
+        fans = FAN_IDS
+    try:
+        prop, path = _detect_fan_prop()
+        info["detected_prop"] = prop
+        info["detected_path"] = path
+    except Exception as e:
+        info["detected_prop_error"] = str(e)
+    # P-IDs mapping
+    try:
+        info["pids"] = _compute_pids(fans)
+    except Exception as e:
+        info["pids_error"] = str(e)
+    # Sensors sample
+    try:
+        s = _ilo_run("show /system1/sensors", timeout=5)
+        info["sensors_preview"] = "\n".join(s.splitlines()[:20])
+    except Exception:
+        pass
+    # Last speeds
+    try:
+        info["last_speeds"] = get_fan_speeds()
+    except Exception:
+        pass
+    return jsonify(info)
 
 
 if __name__ == "__main__":
