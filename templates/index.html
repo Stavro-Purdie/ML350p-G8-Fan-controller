@@ -1,91 +1,43 @@
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="utf-8">
   <title>Dynamic Fan Control</title>
-  <link rel="stylesheet" href="/static/style.css">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <script src="/static/script.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+    .meters { list-style: none; padding: 0; display: flex; gap: 8px; }
+    .meters li { background: #eee; border: 1px solid #ccc; padding: 6px 10px; border-radius: 4px; min-width: 40px; text-align: center; }
+    label { display:block; margin-top: 6px; }
+  </style>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
 </head>
 <body>
-<h1>HP ML350p Gen8 Fan Dashboard</h1>
+  <h1>HP ML350p Gen8 Fan Dashboard</h1>
 
-<div>
-  <p>CPU Temp: <span id="cpu">{{ cpu_temp }}</span> °C</p>
-  <p>GPU Temp: <span id="gpu">{{ gpu_temp }}</span> °C</p>
-  <p>GPU: <span id="gpu_name"></span> <span id="gpu_power"></span></p>
-</div>
+  <div>
+    <p>CPU Temp: <strong>{{ cpu_temp }}</strong> °C</p>
+    <p>GPU Temp: <strong>{{ gpu_temp }}</strong> °C</p>
+  </div>
 
-<div id="health" style="padding:8px; background:#eef; border:1px solid #ccd; margin:10px 0; display:none;"></div>
+  <h2>Fan Speeds</h2>
+  <ul class="meters">
+    {% for s in fan_speeds %}<li>{{ s }}%</li>{% endfor %}
+  </ul>
 
-<h2>Fan Speeds</h2>
-<ul id="fan-speeds" class="meters">
-{% for fan in fan_speeds %}
-  <li>{{ fan }}%</li>
-{% endfor %}
-</ul>
+  <h2>Fan Curve</h2>
+  <form method="post" action="/update_curve">
+    <label>Min Temp: <input type="number" name="minTemp" value="{{ fan_curve.minTemp }}"> °C</label>
+    <label>Max Temp: <input type="number" name="maxTemp" value="{{ fan_curve.maxTemp }}"> °C</label>
+    <label>Min Speed: <input type="number" name="minSpeed" value="{{ fan_curve.minSpeed }}"> %</label>
+    <label>Max Speed: <input type="number" name="maxSpeed" value="{{ fan_curve.maxSpeed }}"> %</label>
+    <div style="margin-top:8px;"><button type="submit">Update Curve</button></div>
+  </form>
 
-<h2>Fan Curve</h2>
-<form method="post" action="/update_curve">
-  Min Temp: <input type="number" name="minTemp" value="{{ fan_curve.minTemp }}"> °C<br>
-  Max Temp: <input type="number" name="maxTemp" value="{{ fan_curve.maxTemp }}"> °C<br>
-  Min Speed: <input type="number" name="minSpeed" value="{{ fan_curve.minSpeed }}"> %<br>
-  Max Speed: <input type="number" name="maxSpeed" value="{{ fan_curve.maxSpeed }}"> %<br>
-  <hr>
-  <strong>GPU Curve (optional)</strong><br>
-  Min Temp: <input type="number" name="gpu_minTemp" value="{{ gpu_minTemp }}"> °C<br>
-  Max Temp: <input type="number" name="gpu_maxTemp" value="{{ gpu_maxTemp }}"> °C<br>
-  Min Speed: <input type="number" name="gpu_minSpeed" value="{{ gpu_minSpeed }}"> %<br>
-  Max Speed: <input type="number" name="gpu_maxSpeed" value="{{ gpu_maxSpeed }}"> %<br>
-  <hr>
-  <strong>Blending</strong><br>
-  Mode:
-  <select name="blend_mode">
-    <option value="max" {{ 'selected' if blend_mode == 'max' else '' }}>Max(CPU, GPU)</option>
-    <option value="weighted" {{ 'selected' if blend_mode == 'weighted' else '' }}>Weighted</option>
-  </select><br>
-  CPU Weight: <input type="number" step="0.1" name="blend_cpuWeight" value="{{ cpu_w }}"> 
-  GPU Weight: <input type="number" step="0.1" name="blend_gpuWeight" value="{{ gpu_w }}"><br>
-  <strong>GPU Boost (optional)</strong><br>
-  Threshold (°C): <input type="number" name="gpuBoost_threshold" value="{{ gb_t }}"> 
-  Add (%) : <input type="number" name="gpuBoost_add" value="{{ gb_a }}"><br>
-  <button type="submit">Update Curve</button>
-</form>
-
-<h2>History</h2>
-<canvas id="tempChart" height="100"></canvas>
-<canvas id="fanChart" height="100"></canvas>
-<p><a href="/export_status" target="_blank">Download status JSON</a> • <a href="/export_curve" target="_blank">Download fan curve JSON</a></p>
-<p><a href="/debug_ilo_fans" target="_blank">Debug iLO fan objects</a></p>
-
-<h2>Other Sensors</h2>
-<table id="sensors" border="1" cellpadding="4" cellspacing="0">
-  <thead><tr><th>Sensor</th><th>Value (°C)</th></tr></thead>
-  <tbody></tbody>
-  </table>
-
-<h2>GPU Info</h2>
-<table id="gpuinfo" border="1" cellpadding="4" cellspacing="0">
-  <thead>
-  <tr>
-    <th>Idx</th><th>Name</th><th>Bus</th><th>Temp</th><th>Util</th><th>Enc/Dec</th>
-    <th>Mem</th><th>Power</th><th>PState</th><th>Clocks</th><th>PCIe</th><th>NVENC Sessions</th>
-  </tr>
-  </thead>
-  <tbody></tbody>
-  </table>
-
-<h2>Service Control</h2>
-<form method="post" action="/control">
-  <button name="action" value="start">Start Fan Control</button>
-  <button name="action" value="stop">Stop Fan Control</button>
-</form>
-
-<h3>Fan Test</h3>
-<form method="post" action="/fan_test" style="margin-top:8px;">
-  Percent: <input type="number" name="test_percent" min="0" max="100" value="100" style="width:70px;"> %
-  Duration: <input type="number" name="test_duration" min="1" max="60" value="10" style="width:70px;"> s
-  <button type="submit">Run Test</button>
-  <small style="color:#555;">Temporarily sets fans, then restores control.</small>
+  <h2>Service Control</h2>
+  <form method="post" action="/control">
+    <button name="action" value="start">Start</button>
+    <button name="action" value="stop">Stop</button>
   </form>
 
 </body>
