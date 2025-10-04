@@ -119,6 +119,12 @@
     <label>Batch Size
       <input type="number" name="ILO_BATCH_SIZE" value="{{ settings.ILO_BATCH_SIZE or 1 }}">
     </label>
+    <label>PWM Units
+      <select name="PWM_UNITS">
+        <option value="percent" {% if settings.PWM_UNITS != 'bits' %}selected{% endif %}>Percent (UI-friendly)</option>
+        <option value="bits" {% if settings.PWM_UNITS == 'bits' %}selected{% endif %}>Bits (1..255 raw)</option>
+      </select>
+    </label>
     <div style="grid-column: 1 / -1; margin-top:6px;"><button type="submit">Save Settings</button></div>
   </form>
 

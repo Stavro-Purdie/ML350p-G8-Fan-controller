@@ -8,6 +8,7 @@ app = Flask(__name__)
 # Default to server install paths; can be overridden by env
 FAN_CURVE_FILE = os.getenv("FAN_CURVE_FILE", "/opt/dynamic-fan-ui/fan_curve.json")
 FAN_SPEED_FILE = os.getenv("FAN_SPEED_FILE", "/opt/dynamic-fan-ui/fan_speeds.txt")
+FAN_SPEED_BITS_FILE = os.getenv("FAN_SPEED_BITS_FILE", "/opt/dynamic-fan-ui/fan_speeds_bits.txt")
 UI_CONFIG_FILE = os.getenv("UI_CONFIG_FILE", "/opt/dynamic-fan-ui/ui_config.json")
 FAN_IDS = ["fan2", "fan3", "fan4"]
 # Allow override via env string: FAN_IDS_STR="fan2 fan3 fan4"
@@ -30,6 +31,7 @@ except Exception:
     ILO_PID_OFFSET = -1
 ILO_FAN_PROP = os.getenv("ILO_FAN_PROP", "")
 ILO_SSH_TTY = os.getenv("ILO_SSH_TTY", "1") == "1"  # some iLO shells require a TTY
+PWM_UNITS = os.getenv("PWM_UNITS", "bits")
 try:
     ILO_SSH_TIMEOUT = int(os.getenv("ILO_SSH_TIMEOUT", "20"))
 except Exception:
@@ -98,6 +100,26 @@ def load_curve():
     return data
 
 
+def _read_bits_file() -> List[int]:
+    vals: List[int] = []
+    try:
+        if os.path.exists(FAN_SPEED_BITS_FILE):
+            with open(FAN_SPEED_BITS_FILE) as f:
+                for line in f:
+                    s = line.strip()
+                    try:
+                        vals.append(int(s))
+                    except Exception:
+                        vals.append(0)
+    except Exception:
+        vals = []
+    if len(vals) < len(FAN_IDS):
+        vals += [0] * (len(FAN_IDS) - len(vals))
+    else:
+        vals = vals[:len(FAN_IDS)]
+    return vals
+
+
 def get_fan_speeds():
     vals: List[int] = []
     try:
@@ -115,6 +137,23 @@ def get_fan_speeds():
         vals += [0] * (len(FAN_IDS) - len(vals))
     else:
         vals = vals[:len(FAN_IDS)]
+    # If daemon runs in bits domain, convert bits->percent for UI
+    if (os.getenv("PWM_UNITS", PWM_UNITS) or "").lower() == "bits":
+        bits = _read_bits_file()
+        pct = []
+        for b in bits:
+            try:
+                b = int(b)
+            except Exception:
+                b = 0
+            if b < 1:
+                pct.append(0)
+            else:
+                v = (b * 100 + 127) // 255
+                if v < 0: v = 0
+                if v > 100: v = 100
+                pct.append(v)
+        return pct
     return vals
 
 
@@ -154,6 +193,7 @@ _DETECTED_PROP: Optional[str] = None
 _DETECTED_PATH: Optional[str] = None
 _COMPUTED_PIDS: Optional[List[int]] = None
 _ILO_RECENT = deque(maxlen=200)
+_ILO_ACTUALS = {"ts": 0.0, "map": {}}
 
 
 def _load_ui_config():
@@ -168,7 +208,7 @@ def _load_ui_config():
 
 def _apply_ui_overrides(cfg: Optional[dict] = None):
     global ILO_SSH_LEGACY, ILO_SSH_TTY, ILO_SSH_TIMEOUT, ILO_SSH_PERSIST
-    global ILO_MODDED, ILO_PID_OFFSET, _EXPLICIT_PIDS, ILO_FAN_PROP
+    global ILO_MODDED, ILO_PID_OFFSET, _EXPLICIT_PIDS, ILO_FAN_PROP, PWM_UNITS
     if cfg is None:
         cfg = _load_ui_config()
     if not isinstance(cfg, dict):
@@ -191,6 +231,8 @@ def _apply_ui_overrides(cfg: Optional[dict] = None):
             _EXPLICIT_PIDS = [int(x) for x in s.split() if x.isdigit()] if s else []
         if "ILO_FAN_PROP" in cfg:
             ILO_FAN_PROP = str(cfg["ILO_FAN_PROP"]).strip()
+        if "PWM_UNITS" in cfg:
+            PWM_UNITS = str(cfg["PWM_UNITS"]).strip().lower() or "percent"
     except Exception:
         pass
 
@@ -427,19 +469,22 @@ def ilo_set_speed_percent_modded(pid: int, percent: int) -> bool:
     """Set exact fan using separate max then min commands (1..255) for modded iLO."""
     v = max(0, min(100, int(percent)))
     v255 = max(1, min(255, (v * 255 + 50) // 100))
-    vmin = max(1, v255 - 8)  # min 8 steps below max to avoid iLO quirks
+    vmin = max(1, v255 - 4)  # min 4 steps below max
     ok = True
     try:
         _ilo_run(f"fan p {pid} max {v255}")
     except Exception:
         ok = False
     try:
-        # small delay to help iLO apply sequentially
-        time.sleep(0.1)
+        # increased delay to help iLO apply sequentially
+        time.sleep(2.0)
         _ilo_run(f"fan p {pid} min {vmin}")
     except Exception:
         ok = False
     return ok
+
+
+_LAST_CPU_TEMP: Optional[int] = None
 
 
 def get_temps():
@@ -465,6 +510,16 @@ def get_temps():
             cpu_temp = m.group(1) if m else ""
         except Exception:
             cpu_temp = ""
+    # Retain last non-zero CPU temp if we got an empty/zero reading
+    try:
+        global _LAST_CPU_TEMP
+        v = int(cpu_temp) if cpu_temp and cpu_temp.isdigit() else 0
+        if v > 0:
+            _LAST_CPU_TEMP = v
+        elif _LAST_CPU_TEMP is not None:
+            cpu_temp = str(_LAST_CPU_TEMP)
+    except Exception:
+        pass
     # GPU via nvidia-smi
     gpu_temp = ""; gpu_name = ""; gpu_power = ""
     try:
@@ -501,6 +556,7 @@ def index():
         "ILO_FAN_PROP": ILO_FAN_PROP or "",
         "ILO_CMD_GAP_MS": ILO_CMD_GAP_MS,
         "ILO_BATCH_SIZE": ILO_BATCH_SIZE,
+        "PWM_UNITS": PWM_UNITS,
     }
     return render_template(
         "index.html",
@@ -602,11 +658,56 @@ def status():
     except Exception:
         pass
 
+    # iLO actuals (rate-limited to avoid spam)
+    ilo_map = {}
+    try:
+        now = time.time()
+        if now - _ILO_ACTUALS.get("ts", 0) > 15:
+            try:
+                out = _ilo_run("fan info", timeout=5)
+                actuals_map: dict = {}
+                for line in (out or '').splitlines():
+                    # Match patterns like 'Fan 2 ... 32%' or 'fan2 ... 32%'
+                    mnum = re.search(r"fan\s*([0-9]+)", line, re.IGNORECASE)
+                    mper = re.search(r"([0-9]{1,3})\s*%", line)
+                    if mnum and mper:
+                        key = f"fan{mnum.group(1)}"
+                        try:
+                            actuals_map[key] = int(mper.group(1))
+                        except Exception:
+                            continue
+                _ILO_ACTUALS["ts"] = now
+                _ILO_ACTUALS["map"] = actuals_map
+            except Exception:
+                pass
+        ilo_map = dict(_ILO_ACTUALS.get("map", {}))
+    except Exception:
+        ilo_map = {}
+
+    # Fan bits snapshot for UI comparison
+    try:
+        fan_bits = _read_bits_file()
+    except Exception:
+        fan_bits = []
+
     return jsonify({
         "cpu": cpu, "gpu": gpu, "gpu_name": gpu_name, "gpu_power": gpu_power,
-        "fans": get_fan_speeds(), "sensors": sensors, "gpu_info": gpu_info,
+    "fans": get_fan_speeds(), "fan_bits": fan_bits, "fans_ids": FAN_IDS,
+        "ilo_fan_percents": ilo_map, "ilo_actuals_age": int(time.time() - _ILO_ACTUALS.get("ts", 0)),
+        "sensors": sensors, "gpu_info": gpu_info,
         "service": svc, "ok": True,
     })
+
+
+def _pct_to_bits(p: int) -> int:
+    try:
+        v = max(0, min(100, int(p)))
+    except Exception:
+        v = 0
+    out = (v * 255 + 50) // 100
+    if out < 1: out = 1
+    if out > 255: out = 255
+    return out
 
 
 @app.route("/update_curve", methods=["POST"])
@@ -716,7 +817,7 @@ def _run_quick_test(percent: int, duration: int):
                 v = max(0, min(100, int(p)))
                 return max(1, min(255, (v * 255 + 50) // 100))
             v255 = pct_to_255(percent)
-            vmin = max(1, v255 - 8)
+            vmin = max(1, v255 - 4)
             # Send separate commands per PID with small pacing gap (matches working pattern)
             for pid in pids:
                 try:
@@ -724,8 +825,8 @@ def _run_quick_test(percent: int, duration: int):
                 except Exception:
                     pass
                 try:
-                    # Use a slightly larger gap for tests to ensure reliability on iLO
-                    time.sleep(max(0.2, ILO_CMD_GAP_MS/1000.0))
+                    # Use a larger gap for tests to ensure reliability on iLO
+                    time.sleep(max(2.0, ILO_CMD_GAP_MS/1000.0))
                 except Exception:
                     pass
                 try:
@@ -733,7 +834,7 @@ def _run_quick_test(percent: int, duration: int):
                 except Exception:
                     pass
                 try:
-                    time.sleep(max(0.2, ILO_CMD_GAP_MS/1000.0))
+                    time.sleep(max(2.0, ILO_CMD_GAP_MS/1000.0))
                 except Exception:
                     pass
         else:
@@ -829,7 +930,7 @@ def update_settings():
     fields = [
         "ILO_SSH_LEGACY", "ILO_SSH_TTY", "ILO_SSH_TIMEOUT", "ILO_SSH_PERSIST",
         "ILO_MODDED", "ILO_PID_OFFSET", "FAN_P_IDS_STR", "ILO_FAN_PROP",
-        "ILO_CMD_GAP_MS", "ILO_BATCH_SIZE"
+        "ILO_CMD_GAP_MS", "ILO_BATCH_SIZE", "PWM_UNITS"
     ]
     for k in fields:
         v = request.form.get(k)
@@ -888,6 +989,41 @@ def test_ilo_control():
         result.update({"error": str(e)})
         return jsonify(result), 500
     return jsonify(result)
+
+
+@app.route("/fan_test_bits", methods=["POST"])
+def fan_test_bits():
+    """Send raw PWM values (1..255) to P-IDs 1..N with pacing. Modded only."""
+    if not ILO_MODDED:
+        return jsonify({"ok": False, "error": "Modded mode required"}), 400
+    try:
+        raw = int(request.form.get("bits", "128"))
+    except Exception:
+        raw = 128
+    raw = max(1, min(255, raw))
+    vmin = max(1, raw - 4)
+    # Pause daemon briefly
+    if shutil.which("systemctl"):
+        try:
+            subprocess.check_output(["systemctl", "stop", "dynamic-fans.service"], text=True, timeout=10)
+        except Exception:
+            pass
+    pids = _compute_pids(_discover_fans())
+    for pid in pids:
+        try:
+            _ilo_run(f"fan p {pid} max {raw}")
+        except Exception:
+            pass
+        time.sleep(max(2.0, ILO_CMD_GAP_MS/1000.0))
+        try:
+            _ilo_run(f"fan p {pid} min {vmin}")
+        except Exception:
+            pass
+        time.sleep(max(2.0, ILO_CMD_GAP_MS/1000.0))
+    # Resume daemon
+    if shutil.which("systemctl"):
+        subprocess.Popen(["systemctl", "start", "dynamic-fans.service"])  # async
+    return redirect("/")
 
 
 @app.route("/debug_ilo_fans")

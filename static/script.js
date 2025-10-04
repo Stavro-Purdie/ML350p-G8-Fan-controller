@@ -50,7 +50,10 @@ function poll() {
       }
       const fanList = document.getElementById('fan-speeds');
       fanList.innerHTML = '';
-      data.fans.forEach(f => {
+      const ilo = data.ilo_fan_percents || {};
+      const bits = data.fan_bits || [];
+      const ids = data.fans_ids || [];
+      data.fans.forEach((f, i) => {
         const li = document.createElement('li');
         const meter = document.createElement('div');
         meter.className = 'meter';
@@ -59,7 +62,10 @@ function poll() {
         bar.style.width = (parseInt(f, 10) || 0) + '%';
         meter.appendChild(bar);
         li.appendChild(meter);
-        li.append(' ' + f + '%');
+        const raw = bits[i] ?? '';
+        const fanId = ids[i] || `fan${i+1}`;
+        const iloPct = (ilo && fanId in ilo) ? ` | iLO ${ilo[fanId]}%` : '';
+        li.append(` ${f}% (raw ${raw||''}/255)${iloPct}`);
         fanList.appendChild(li);
       });
       // Sensors table

@@ -21,7 +21,7 @@ VERBOSE="${VERBOSE:-0}"
 ILO_SSH_TIMEOUT="${ILO_SSH_TIMEOUT:-12}"
 ILO_SSH_PERSIST="${ILO_SSH_PERSIST:-60}"
 # Default pacing gap between iLO commands (ms); increase for flaky shells
-ILO_CMD_GAP_MS="${ILO_CMD_GAP_MS:-200}"
+ILO_CMD_GAP_MS="${ILO_CMD_GAP_MS:-2000}"
 ILO_BATCH_SIZE="${ILO_BATCH_SIZE:-1}"
 # Simple millisecond sleep without external deps
 sleep_ms() {
@@ -100,12 +100,16 @@ send_exact_modded() {
 CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
 MAX_STEP="${MAX_STEP:-10}"
 FAN_SPEED_FILE="${FAN_SPEED_FILE:-/opt/dynamic-fan-ui/fan_speeds.txt}"
+FAN_SPEED_BITS_FILE="${FAN_SPEED_BITS_FILE:-/opt/dynamic-fan-ui/fan_speeds_bits.txt}"
 FAN_CURVE_FILE="${FAN_CURVE_FILE:-/opt/dynamic-fan-ui/fan_curve.json}"
+PWM_UNITS="${PWM_UNITS:-bits}"
 
 declare -A LAST_SPEEDS
+declare -A LAST_BITS
 
 # Ensure directories exist
 mkdir -p "$(dirname "$FAN_SPEED_FILE")" "$(dirname "$FAN_CURVE_FILE")"
+mkdir -p "$(dirname "$FAN_SPEED_BITS_FILE")" || true
 
 # Build SSH helper
 SSH_OPTS=("-o" "StrictHostKeyChecking=no")
@@ -161,6 +165,13 @@ if [[ -f "$FAN_SPEED_FILE" ]]; then
     LAST_SPEEDS[${FAN_IDS[i]}]=$line
     ((i++))
   done < "$FAN_SPEED_FILE"
+fi
+if [[ -f "$FAN_SPEED_BITS_FILE" ]]; then
+  i=0
+  while read line; do
+    LAST_BITS[${FAN_IDS[i]}]=$line
+    ((i++))
+  done < "$FAN_SPEED_BITS_FILE"
 fi
 
 # Load fan curve JSON (minTemp,maxTemp,minSpeed,maxSpeed)
@@ -274,40 +285,93 @@ apply_fan_speed() {
       local fan_id=${P_IDS[$idx]}
       local fan=${FAN_IDS[$idx]:-fan$fan_id}
       CURRENT=${LAST_SPEEDS[$fan]:-20}
-      # All fans should follow the same target percent
+      # All fans follow same target percent
       local desired=$target
-      DIFF=$(( desired - CURRENT ))
-      if command -v jq >/dev/null 2>&1; then
-        MINC=$(jq -r '(.minChange // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
-        [[ "$MINC" =~ ^-?[0-9]+$ ]] || MINC=0
-        if (( DIFF != 0 && ${DIFF#-} < MINC )); then
-          DIFF=$(( DIFF<0 ? -MINC : MINC ))
+      # When operating in bits domain, do smoothing in bits
+      if [[ "$PWM_UNITS" == "bits" ]]; then
+        # current bits fallback from current percent
+        local cur_b=${LAST_BITS[$fan]:-0}
+        if (( cur_b <= 0 )); then cur_b=$(( (CURRENT * 255 + 50) / 100 )); fi
+        (( cur_b < 1 )) && cur_b=1
+        (( cur_b > 255 )) && cur_b=255
+        local des_b=$(( (desired * 255 + 50) / 100 ))
+        (( des_b < 1 )) && des_b=1
+        (( des_b > 255 )) && des_b=255
+        local DIFF_B=$(( des_b - cur_b ))
+        # Optional minChange in bits
+        if command -v jq >/dev/null 2>&1; then
+          MINC=$(jq -r '(.minChange // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
+          [[ "$MINC" =~ ^-?[0-9]+$ ]] || MINC=0
+          local MINC_B=$(( (MINC * 255 + 50) / 100 ))
+          if (( MINC_B < 0 )); then MINC_B=$(( -MINC_B )); fi
+          if (( DIFF_B != 0 && ${DIFF_B#-} < MINC_B )); then
+            DIFF_B=$(( DIFF_B<0 ? -MINC_B : MINC_B ))
+          fi
         fi
-      fi
-      if (( DIFF > MAX_STEP )); then DIFF=$MAX_STEP
-      elif (( DIFF < -MAX_STEP )); then DIFF=-MAX_STEP; fi
-  NEW=$(( CURRENT + DIFF ))
-      (( NEW < 0 )) && NEW=0
-      (( NEW > 100 )) && NEW=100
-      # Map percent to 1..255 (avoid 0)
-      local v255=$(( (NEW * 255 + 50) / 100 ))
-      (( v255 < 1 )) && v255=1
-      (( v255 > 255 )) && v255=255
-      # Skip unchanged to avoid spamming iLO
-      if (( NEW != CURRENT )); then
-        # min is 8 steps below max (clamped)
-        local vmin=$(( v255 - 8 ))
-        (( vmin < 1 )) && vmin=1
-        if send_exact_modded "$fan_id" "$v255" "$vmin"; then
-          ((updates_sent++))
-          updated_pids+=("$fan_id")
-          LAST_SPEEDS[$fan]=$NEW
+        # Max step in bits
+        local MAX_STEP_B=$(( (MAX_STEP * 255 + 50) / 100 ))
+        (( MAX_STEP_B < 1 )) && MAX_STEP_B=1
+        if (( DIFF_B > MAX_STEP_B )); then DIFF_B=$MAX_STEP_B
+        elif (( DIFF_B < -MAX_STEP_B )); then DIFF_B=$(( -MAX_STEP_B )); fi
+        local NEW_B=$(( cur_b + DIFF_B ))
+        (( NEW_B < 1 )) && NEW_B=1
+        (( NEW_B > 255 )) && NEW_B=255
+        # Convert back to percent for status persistence
+        local NEW=$(( (NEW_B * 100 + 127) / 255 ))
+        # Skip unchanged
+        if (( NEW_B != cur_b )); then
+          local v255=$NEW_B
+          local vmin=$(( NEW_B - 4 )); (( vmin < 1 )) && vmin=1
+          if send_exact_modded "$fan_id" "$v255" "$vmin"; then
+            ((updates_sent++))
+            updated_pids+=("$fan_id")
+            LAST_SPEEDS[$fan]=$NEW
+            LAST_BITS[$fan]=$NEW_B
+          fi
         else
-          # Leave LAST_SPEEDS unchanged so we retry next loop
-          :
+          LAST_SPEEDS[$fan]=$NEW
+          LAST_BITS[$fan]=$NEW_B
         fi
       else
-        LAST_SPEEDS[$fan]=$NEW
+        # Percent-domain smoothing (default)
+        DIFF=$(( desired - CURRENT ))
+        if command -v jq >/dev/null 2>&1; then
+          MINC=$(jq -r '(.minChange // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
+          [[ "$MINC" =~ ^-?[0-9]+$ ]] || MINC=0
+          if (( DIFF != 0 && ${DIFF#-} < MINC )); then
+            DIFF=$(( DIFF<0 ? -MINC : MINC ))
+          fi
+        fi
+        if (( DIFF > MAX_STEP )); then DIFF=$MAX_STEP
+        elif (( DIFF < -MAX_STEP )); then DIFF=-MAX_STEP; fi
+        NEW=$(( CURRENT + DIFF ))
+        (( NEW < 0 )) && NEW=0
+        (( NEW > 100 )) && NEW=100
+        # Map percent to 1..255 (avoid 0)
+        local v255=$(( (NEW * 255 + 50) / 100 ))
+        (( v255 < 1 )) && v255=1
+        (( v255 > 255 )) && v255=255
+        # Skip unchanged to avoid spamming iLO
+        if (( NEW != CURRENT )); then
+          # min is 8 steps below max (clamped)
+          local vmin=$(( v255 - 4 ))
+          (( vmin < 1 )) && vmin=1
+          if send_exact_modded "$fan_id" "$v255" "$vmin"; then
+            ((updates_sent++))
+            updated_pids+=("$fan_id")
+            LAST_SPEEDS[$fan]=$NEW
+            LAST_BITS[$fan]=$v255
+          else
+            :
+          fi
+        else
+          LAST_SPEEDS[$fan]=$NEW
+          # ensure bits snapshot stays in sync
+          local v255_u=$(( (NEW * 255 + 50) / 100 ))
+          (( v255_u < 1 )) && v255_u=1
+          (( v255_u > 255 )) && v255_u=255
+          LAST_BITS[$fan]=$v255_u
+        fi
       fi
     done
   else
@@ -348,10 +412,13 @@ apply_fan_speed() {
       echo "[loop] updates_sent=$updates_sent" >&2
     fi
   fi
-  # Save current speeds
+  # Save current speeds (percent) and raw bits
   for fan in "${FAN_IDS[@]}"; do
     echo ${LAST_SPEEDS[$fan]}
-  done > $FAN_SPEED_FILE
+  done > "$FAN_SPEED_FILE"
+  for fan in "${FAN_IDS[@]}"; do
+    echo ${LAST_BITS[$fan]:-0}
+  done > "$FAN_SPEED_BITS_FILE"
 }
 
 # Main loop
