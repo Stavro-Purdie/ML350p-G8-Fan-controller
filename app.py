@@ -658,28 +658,46 @@ def status():
     except Exception:
         pass
 
-    # iLO actuals (rate-limited to avoid spam)
+    # iLO actuals: prefer per-fan object query to avoid 'fan info'; rate-limited
     ilo_map = {}
     try:
         now = time.time()
-        if now - _ILO_ACTUALS.get("ts", 0) > 15:
+        if now - _ILO_ACTUALS.get("ts", 0) > 10:
+            actuals_map: dict = {}
+            # Query discovered fans; fall back to configured FAN_IDS
             try:
-                out = _ilo_run("fan info", timeout=5)
-                actuals_map: dict = {}
-                for line in (out or '').splitlines():
-                    # Match patterns like 'Fan 2 ... 32%' or 'fan2 ... 32%'
-                    mnum = re.search(r"fan\s*([0-9]+)", line, re.IGNORECASE)
-                    mper = re.search(r"([0-9]{1,3})\s*%", line)
-                    if mnum and mper:
-                        key = f"fan{mnum.group(1)}"
-                        try:
-                            actuals_map[key] = int(mper.group(1))
-                        except Exception:
-                            continue
-                _ILO_ACTUALS["ts"] = now
-                _ILO_ACTUALS["map"] = actuals_map
+                fans = _discover_fans()
+                if not fans:
+                    fans = FAN_IDS
             except Exception:
-                pass
+                fans = FAN_IDS
+            for fan in fans:
+                try:
+                    out = _ilo_run(f"show /system1/{fan}", timeout=5)
+                except Exception:
+                    continue
+                # Look for a percent-like property among known candidates
+                val = None
+                for line in out.splitlines():
+                    if ('=' in line) or (':' in line):
+                        parts = re.split(r"[:=]", line, maxsplit=1)
+                        if len(parts) < 2:
+                            continue
+                        key = parts[0].strip().lower()
+                        if any(k in key for k in ("speed","pwm","duty","duty_cycle","fan_speed","percentage")):
+                            m = re.search(r"(\d{1,3})", parts[1])
+                            if m:
+                                try:
+                                    n = int(m.group(1))
+                                    if 0 <= n <= 100:
+                                        val = n
+                                        break
+                                except Exception:
+                                    pass
+                if val is not None:
+                    actuals_map[fan] = val
+            _ILO_ACTUALS["ts"] = now
+            _ILO_ACTUALS["map"] = actuals_map
         ilo_map = dict(_ILO_ACTUALS.get("map", {}))
     except Exception:
         ilo_map = {}

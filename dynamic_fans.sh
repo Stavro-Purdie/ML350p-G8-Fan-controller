@@ -79,16 +79,23 @@ fi
 
 # Helper to send exact max/min with retries and backoff
 send_exact_modded() {
-  local pid=$1 vmax=$2 vmin=$3
-  local attempt gap ok_max ok_min
+  local pid=$1 vmax=$2 vmin=$3 order=${4:-inc}
+  local attempt gap ok_a ok_b cmd_a cmd_b label_a label_b
   gap=$ILO_CMD_GAP_MS
+  if [[ "$order" == "dec" ]]; then
+    cmd_a=(fan p $pid min $vmin); label_a="min $vmin"
+    cmd_b=(fan p $pid max $vmax); label_b="max $vmax"
+  else
+    cmd_a=(fan p $pid max $vmax); label_a="max $vmax"
+    cmd_b=(fan p $pid min $vmin); label_b="min $vmin"
+  fi
   for attempt in 1 2 3; do
-    ok_max=0; ok_min=0
-    if ssh_ilo "fan p $pid max $vmax" >/dev/null 2>&1; then ok_max=1; else echo "WARN: Failed: fan p $pid max $vmax (try $attempt)" >&2; fi
+    ok_a=0; ok_b=0
+    if ssh_ilo "${cmd_a[*]}" >/dev/null 2>&1; then ok_a=1; else echo "WARN: Failed: fan p $pid $label_a (try $attempt)" >&2; fi
     sleep_ms "$gap"
-    if ssh_ilo "fan p $pid min $vmin" >/dev/null 2>&1; then ok_min=1; else echo "WARN: Failed: fan p $pid min $vmin (try $attempt)" >&2; fi
+    if ssh_ilo "${cmd_b[*]}" >/dev/null 2>&1; then ok_b=1; else echo "WARN: Failed: fan p $pid $label_b (try $attempt)" >&2; fi
     sleep_ms "$gap"
-    if (( ok_max == 1 && ok_min == 1 )); then return 0; fi
+    if (( ok_a == 1 && ok_b == 1 )); then return 0; fi
     # Exponential backoff up to ~800ms
     gap=$(( gap < 800 ? gap*2 : gap ))
   done
@@ -324,7 +331,9 @@ apply_fan_speed() {
         if (( NEW_B != cur_b )); then
           local v255=$NEW_B
           local vmin=$(( NEW_B - 4 )); (( vmin < 1 )) && vmin=1
-          if send_exact_modded "$fan_id" "$v255" "$vmin"; then
+          local order="inc"
+          if (( NEW_B < cur_b )); then order="dec"; fi
+          if send_exact_modded "$fan_id" "$v255" "$vmin" "$order"; then
             ((updates_sent++))
             updated_pids+=("$fan_id")
             LAST_SPEEDS[$fan]=$NEW
@@ -358,7 +367,9 @@ apply_fan_speed() {
           # min is 8 steps below max (clamped)
           local vmin=$(( v255 - 4 ))
           (( vmin < 1 )) && vmin=1
-          if send_exact_modded "$fan_id" "$v255" "$vmin"; then
+          local order="inc"
+          if (( NEW < CURRENT )); then order="dec"; fi
+          if send_exact_modded "$fan_id" "$v255" "$vmin" "$order"; then
             ((updates_sent++))
             updated_pids+=("$fan_id")
             LAST_SPEEDS[$fan]=$NEW
