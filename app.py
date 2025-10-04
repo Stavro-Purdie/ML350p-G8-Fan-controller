@@ -258,11 +258,30 @@ def index():
     cpu_temp, gpu_temp, gpu_name, gpu_power = get_temps()
     fan_speeds = get_fan_speeds()
     # Load fan curve; if missing, show sensible defaults
-    fan_curve = {"minTemp": 30, "maxTemp": 80, "minSpeed": 20, "maxSpeed": 100}
+    fan_curve: Dict[str, Any] = {"minTemp": 30, "maxTemp": 80, "minSpeed": 20, "maxSpeed": 100}
     try:
         if os.path.exists(FAN_CURVE_FILE):
             with open(FAN_CURVE_FILE) as f:
-                fan_curve = json.load(f)
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    fan_curve.update(loaded)
+    except Exception:
+        pass
+    # Harden optional sections so templates never 500 when keys are absent
+    try:
+        # Ensure base keys exist and are the right type
+        for k, v in {"minTemp": 30, "maxTemp": 80, "minSpeed": 20, "maxSpeed": 100}.items():
+            if k not in fan_curve:
+                fan_curve[k] = v
+        # Blend defaults
+        if not isinstance(fan_curve.get("blend"), dict):
+            fan_curve["blend"] = {}
+        fan_curve["blend"].setdefault("mode", "max")
+        fan_curve["blend"].setdefault("cpuWeight", 0.5)
+        fan_curve["blend"].setdefault("gpuWeight", 0.5)
+        # GPU Boost optional; leave empty unless provided, but ensure dict
+        if not isinstance(fan_curve.get("gpuBoost"), dict):
+            fan_curve["gpuBoost"] = {}
     except Exception:
         pass
     return render_template("index.html", cpu_temp=cpu_temp, gpu_temp=gpu_temp,
