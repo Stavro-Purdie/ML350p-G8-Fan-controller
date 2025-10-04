@@ -249,6 +249,27 @@ def update_curve():
         except Exception:
             pass
     os.makedirs(os.path.dirname(FAN_CURVE_FILE), exist_ok=True)
+    # Optional blending
+    try:
+        mode = request.form.get("blend_mode", "max")
+        cpu_w = float(request.form.get("blend_cpuWeight", "0.5"))
+        gpu_w = float(request.form.get("blend_gpuWeight", "0.5"))
+        data["blend"] = {"mode": mode, "cpuWeight": cpu_w, "gpuWeight": gpu_w}
+    except Exception:
+        pass
+    # Optional GPU boost
+    try:
+        t = request.form.get("gpuBoost_threshold")
+        a = request.form.get("gpuBoost_add")
+        boost: Dict[str, Any] = {}
+        if t is not None and t != "":
+            boost["threshold"] = int(t)
+        if a is not None and a != "":
+            boost["add"] = int(a)
+        if boost:
+            data["gpuBoost"] = boost
+    except Exception:
+        pass
     with open(FAN_CURVE_FILE, "w") as f:
         json.dump(data, f)
     return redirect("/")

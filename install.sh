@@ -51,11 +51,15 @@ if [[ "$use_ipmi" =~ ^[Yy]$ ]]; then USE_IPMI_TEMPS=1; else USE_IPMI_TEMPS=0; fi
 read -r -p "Enable legacy SSH algorithms for older iLO (fixes KEX error)? (y/n) [y]: " legacy
 legacy=${legacy:-y}
 if [[ "$legacy" =~ ^[Yy]$ ]]; then ILO_SSH_LEGACY=1; else ILO_SSH_LEGACY=0; fi
-read -r -p "Which fan indices are installed? e.g., '2 3 4' (leave blank for default all): " fan_idxs
+read -r -p "Which fan indices are installed? Enter numbers separated by a space (e.g., 2 3 4). Leave blank for all: " fan_idxs
 fan_idxs=${fan_idxs:-}
 if [[ -n "$fan_idxs" ]]; then
-  # Build space-separated list like: fan2 fan3 fan4
-  FAN_IDS_STR=$(printf "%s\n" $fan_idxs | awk '{for(i=1;i<=NF;i++) printf "fan%s%s", $i, (i<NF?" ":"\n") }')
+  # Build space-separated list like: fan2 fan3 fan4 (user entered numbers with spaces)
+  FAN_IDS_STR=""
+  for n in $fan_idxs; do
+    [[ -n "$n" ]] && FAN_IDS_STR+="fan${n} "
+  done
+  FAN_IDS_STR=${FAN_IDS_STR% }
 fi
 read -r -p "Install and enable systemd service? (y/n) [y]: " sysd
 sysd=${sysd:-y}
@@ -322,14 +326,45 @@ fan_ramp_test() {
   else
     fans=(fan1 fan2 fan3 fan4 fan5)
   fi
+  echo "Probing fan objects..."
+  for f in "${fans[@]}"; do
+    set +e
+    local info
+    info=$("${base[@]}" "show /system1/$f" 2>/dev/null)
+    local rc=$?
+    set -e
+    if [[ $rc -ne 0 || -z "$info" ]]; then
+      echo " ! Could not query /system1/$f (object may differ on this iLO)"
+    else
+      echo " ✓ Found $f"
+    fi
+  done
   for f in "${fans[@]}"; do
     echo " - $f => 100%"
-    "${base[@]}" "set /system1/$f speed=100" >/dev/null 2>&1 || true
+    set +e
+    local out rc
+    out=$("${base[@]}" "set /system1/$f speed=100" 2>&1); rc=$?
+    if [[ $rc -ne 0 ]]; then
+      out=$("${base[@]}" "set /system1/fans1/$f speed=100" 2>&1); rc=$?
+    fi
+    set -e
+    if [[ $rc -ne 0 ]]; then
+      echo " ! Failed to set $f to 100%: $out"
+    fi
+    # Read back for confirmation if possible
+    set +e
+    local after
+  after=$("${base[@]}" "show /system1/$f" 2>/dev/null | grep -i speed | head -1)
+  [[ -z "$after" ]] && after=$("${base[@]}" "show /system1/fans1/$f" 2>/dev/null | grep -i speed | head -1)
+    set -e
+    [[ -n "$after" ]] && echo "   > $after"
   done
   sleep 10
   for f in "${fans[@]}"; do
     echo " - $f => 30%"
-    "${base[@]}" "set /system1/$f speed=30" >/dev/null 2>&1 || true
+    set +e
+    "${base[@]}" "set /system1/$f speed=30" >/dev/null 2>&1 || "${base[@]}" "set /system1/fans1/$f speed=30" >/dev/null 2>&1 || true
+    set -e
   done
   echo "Fan ramp test complete."
 }

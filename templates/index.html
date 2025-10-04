@@ -36,6 +36,18 @@
   Max Temp: <input type="number" name="gpu_maxTemp" value="{{ fan_curve.gpu.maxTemp if fan_curve.gpu is defined else '' }}"> °C<br>
   Min Speed: <input type="number" name="gpu_minSpeed" value="{{ fan_curve.gpu.minSpeed if fan_curve.gpu is defined else '' }}"> %<br>
   Max Speed: <input type="number" name="gpu_maxSpeed" value="{{ fan_curve.gpu.maxSpeed if fan_curve.gpu is defined else '' }}"> %<br>
+  <hr>
+  <strong>Blending</strong><br>
+  Mode:
+  <select name="blend_mode">
+    <option value="max" {{ 'selected' if fan_curve.blend.mode == 'max' else '' }}>Max(CPU, GPU)</option>
+    <option value="weighted" {{ 'selected' if fan_curve.blend.mode == 'weighted' else '' }}>Weighted</option>
+  </select><br>
+  CPU Weight: <input type="number" step="0.1" name="blend_cpuWeight" value="{{ fan_curve.blend.cpuWeight if fan_curve.blend is defined and fan_curve.blend.cpuWeight is defined else '0.5' }}"> 
+  GPU Weight: <input type="number" step="0.1" name="blend_gpuWeight" value="{{ fan_curve.blend.gpuWeight if fan_curve.blend is defined and fan_curve.blend.gpuWeight is defined else '0.5' }}"><br>
+  <strong>GPU Boost (optional)</strong><br>
+  Threshold (°C): <input type="number" name="gpuBoost_threshold" value="{{ fan_curve.gpuBoost.threshold if fan_curve.gpuBoost is defined and fan_curve.gpuBoost.threshold is defined else '' }}"> 
+  Add (%) : <input type="number" name="gpuBoost_add" value="{{ fan_curve.gpuBoost.add if fan_curve.gpuBoost is defined and fan_curve.gpuBoost.add is defined else '0' }}"><br>
   <button type="submit">Update Curve</button>
 </form>
 

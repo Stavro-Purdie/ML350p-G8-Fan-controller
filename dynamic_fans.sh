@@ -14,9 +14,36 @@ USE_IPMI_TEMPS="${USE_IPMI_TEMPS:-0}"
 ILO_SSH_LEGACY="${ILO_SSH_LEGACY:-0}"
 
 FAN_IDS=("fan1" "fan2" "fan3" "fan4" "fan5")
+# Allow overriding the base path(s) to fan objects
+FAN_PATHS=("/system1" "/system1/fans1")
 # Allow override via space-separated env string, e.g. FAN_IDS_STR="fan1 fan2 fan3 fan4 fan5"
 if [[ -n "${FAN_IDS_STR:-}" ]]; then
   read -r -a FAN_IDS <<<"$FAN_IDS_STR"
+fi
+
+# Attempt auto-discovery of fan objects if FAN_IDS appears invalid
+auto_discover_fans() {
+  local discovered=()
+  for p in "${FAN_PATHS[@]}"; do
+    local out
+    out=$(ssh_ilo "show $p" 2>/dev/null || true)
+    if [[ -n "$out" ]]; then
+      # Look for tokens like fan1, fan2 etc.
+      while read -r tok; do
+        [[ -n "$tok" ]] && discovered+=("$tok")
+      done < <(echo "$out" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^fan[0-9]+$/) print $i}' | sort -u)
+    fi
+    if (( ${#discovered[@]} > 0 )); then
+      echo "Auto-discovered fans at $p: ${discovered[*]}" >&2
+      FAN_IDS=("${discovered[@]}")
+      return
+    fi
+  done
+}
+
+# Validate that first fan is queryable; otherwise try to discover
+if ! ssh_ilo "show /system1/${FAN_IDS[0]}" >/dev/null 2>&1 && ! ssh_ilo "show /system1/fans1/${FAN_IDS[0]}" >/dev/null 2>&1; then
+  auto_discover_fans
 fi
 
 CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
@@ -85,19 +112,25 @@ get_cpu_temp() {
     if command -v ipmitool >/dev/null 2>&1; then
       # Read highest CPU temperature via SDRs; prefer values with trailing C or 'degrees C'
       ipmitool -I lanplus -H "$ILO_IP" -U "$ILO_USER" ${ILO_PASSWORD:+-P "$ILO_PASSWORD"} sdr type Temperature \
-        | awk 'tolower($0) ~ /cpu|proc|processor/ { \
-            if (match(tolower($0), /([0-9]+)\s*degrees?\s*c/, m)) { print m[1]; } \
-            else if (match(tolower($0), /([0-9]+)c/, m)) { print m[1]; } \
-            else if (match($0, /([0-9]+)/, m)) { print m[1]; } \
-          }' | sort -nr | head -1
+        | awk '
+          tolower($0) ~ /cpu|proc|processor/ {
+            if (match(tolower($0), /([0-9]+)[[:space:]]*degrees?[[:space:]]*c/, m)) { print m[1]; }
+            else if (match(tolower($0), /([0-9]+)c/, m)) { print m[1]; }
+            else if (match($0, /([0-9]+)/, m)) { print m[1]; }
+          }
+        ' | sort -nr | head -1
       return
     fi
   fi
   # Fallback to iLO sensors over SSH; prefer values with trailing C
-  ssh_ilo "show /system1/sensors" | awk 'tolower($0) ~ /cpu|proc|processor/ { \
-      if (match(tolower($0), /([0-9]+)c/, m)) { print m[1]; } \
-      else { for (i=1;i<=NF;i++) if (match($i, /^([0-9]+)$/ , n)) print n[1]; } \
-    }' | sort -nr | head -1
+  ssh_ilo "show /system1/sensors" | awk '
+    tolower($0) ~ /cpu|proc|processor/ {
+      if (match(tolower($0), /([0-9]+)c/, m)) { print m[1]; }
+      else {
+        for (i=1;i<=NF;i++) if (match($i, /^([0-9]+)$/, n)) print n[1];
+      }
+    }
+  ' | sort -nr | head -1
 }
 
 get_gpu_temp() {
@@ -137,6 +170,17 @@ calc_targets() {
 
 apply_fan_speed() {
   local target=$1
+  # Helper to set speed with path fallbacks
+  ilo_set_speed() {
+    local fan=$1 val=$2
+    local ok=1
+    for prefix in "${FAN_PATHS[@]}"; do
+      if ssh_ilo "set $prefix/$fan speed=$val" >/dev/null 2>&1; then
+        ok=0; break
+      fi
+    done
+    return $ok
+  }
   for fan in "${FAN_IDS[@]}"; do
     CURRENT=${LAST_SPEEDS[$fan]:-20}
     DIFF=$(( target - CURRENT ))
@@ -154,7 +198,7 @@ apply_fan_speed() {
     # Clamp to [0,100]
     (( NEW < 0 )) && NEW=0
     (( NEW > 100 )) && NEW=100
-    if ! ssh_ilo "set /system1/$fan speed=$NEW" >/dev/null 2>&1; then
+    if ! ilo_set_speed "$fan" "$NEW"; then
       echo "WARN: Failed to set $fan to $NEW" >&2
     fi
     LAST_SPEEDS[$fan]=$NEW
@@ -173,7 +217,28 @@ while true; do
   [[ "$CPU_TEMP" =~ ^[0-9]+$ ]] || CPU_TEMP=0
   [[ "$GPU_TEMP" =~ ^[0-9]+$ ]] || GPU_TEMP=0
   read CPU_TARGET GPU_TARGET < <(calc_targets "$CPU_TEMP" "$GPU_TEMP")
-  FAN_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
+  # Blend mode and GPU boost
+  BLEND_MODE=$(jq -r '(.blend.mode // "max")' "$FAN_CURVE_FILE" 2>/dev/null || echo max)
+  if [[ "$BLEND_MODE" == "weighted" ]]; then
+    CW=$(jq -r '(.blend.cpuWeight // 0.5)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.5)
+    GW=$(jq -r '(.blend.gpuWeight // 0.5)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.5)
+    ZERO=$(awk -v cw="$CW" -v gw="$GW" 'BEGIN{print (cw+gw==0)?1:0}')
+    if [[ "$ZERO" == "1" ]]; then
+      FAN_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
+    else
+      FAN_TARGET=$(awk -v c="$CPU_TARGET" -v g="$GPU_TARGET" -v cw="$CW" -v gw="$GW" 'BEGIN{printf("%d", int(c*cw + g*gw + 0.5))}')
+    fi
+  else
+    FAN_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
+  fi
+  # Optional GPU boost when GPU temp exceeds threshold
+  GB_T=$(jq -r '(.gpuBoost.threshold // empty)' "$FAN_CURVE_FILE" 2>/dev/null || true)
+  GB_A=$(jq -r '(.gpuBoost.add // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
+  if [[ -n "$GB_T" && "$GB_T" =~ ^[0-9]+$ && "$GPU_TEMP" -ge "$GB_T" ]]; then
+    FAN_TARGET=$(( FAN_TARGET + GB_A ))
+  fi
+  (( FAN_TARGET < 0 )) && FAN_TARGET=0
+  (( FAN_TARGET > 100 )) && FAN_TARGET=100
   apply_fan_speed $FAN_TARGET
   # Log a lightweight heartbeat for diagnostics (visible in journalctl)
   echo "CPU=${CPU_TEMP}C GPU=${GPU_TEMP}C -> target=${FAN_TARGET}% speeds=[${FAN_IDS[*]}]" | sed 's/ /,/g' >&2
