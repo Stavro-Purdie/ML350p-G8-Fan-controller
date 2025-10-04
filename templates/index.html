@@ -3,6 +3,7 @@
 <head>
   <title>Dynamic Fan Control</title>
   <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="/static/script.js"></script>
 </head>
 <body>
@@ -11,10 +12,13 @@
 <div>
   <p>CPU Temp: <span id="cpu">{{ cpu_temp }}</span> °C</p>
   <p>GPU Temp: <span id="gpu">{{ gpu_temp }}</span> °C</p>
+  <p>GPU: <span id="gpu_name"></span> <span id="gpu_power"></span></p>
 </div>
 
+<div id="health" style="padding:8px; background:#eef; border:1px solid #ccd; margin:10px 0; display:none;"></div>
+
 <h2>Fan Speeds</h2>
-<ul id="fan-speeds">
+<ul id="fan-speeds" class="meters">
 {% for fan in fan_speeds %}
   <li>{{ fan }}%</li>
 {% endfor %}
@@ -26,8 +30,36 @@
   Max Temp: <input type="number" name="maxTemp" value="{{ fan_curve.maxTemp }}"> °C<br>
   Min Speed: <input type="number" name="minSpeed" value="{{ fan_curve.minSpeed }}"> %<br>
   Max Speed: <input type="number" name="maxSpeed" value="{{ fan_curve.maxSpeed }}"> %<br>
+  <hr>
+  <strong>GPU Curve (optional)</strong><br>
+  Min Temp: <input type="number" name="gpu_minTemp" value="{{ fan_curve.gpu.minTemp if fan_curve.gpu is defined else '' }}"> °C<br>
+  Max Temp: <input type="number" name="gpu_maxTemp" value="{{ fan_curve.gpu.maxTemp if fan_curve.gpu is defined else '' }}"> °C<br>
+  Min Speed: <input type="number" name="gpu_minSpeed" value="{{ fan_curve.gpu.minSpeed if fan_curve.gpu is defined else '' }}"> %<br>
+  Max Speed: <input type="number" name="gpu_maxSpeed" value="{{ fan_curve.gpu.maxSpeed if fan_curve.gpu is defined else '' }}"> %<br>
   <button type="submit">Update Curve</button>
 </form>
+
+<h2>History</h2>
+<canvas id="tempChart" height="100"></canvas>
+<canvas id="fanChart" height="100"></canvas>
+<p><a href="/export_status" target="_blank">Download status JSON</a> • <a href="/export_curve" target="_blank">Download fan curve JSON</a></p>
+
+<h2>Other Sensors</h2>
+<table id="sensors" border="1" cellpadding="4" cellspacing="0">
+  <thead><tr><th>Sensor</th><th>Value (°C)</th></tr></thead>
+  <tbody></tbody>
+  </table>
+
+<h2>GPU Info</h2>
+<table id="gpuinfo" border="1" cellpadding="4" cellspacing="0">
+  <thead>
+  <tr>
+    <th>Idx</th><th>Name</th><th>Bus</th><th>Temp</th><th>Util</th><th>Enc/Dec</th>
+    <th>Mem</th><th>Power</th><th>PState</th><th>Clocks</th><th>PCIe</th><th>NVENC Sessions</th>
+  </tr>
+  </thead>
+  <tbody></tbody>
+  </table>
 
 <h2>Service Control</h2>
 <form method="post" action="/control">

@@ -9,6 +9,7 @@ set -euo pipefail
 PREFIX=${PREFIX:-/usr/local}
 APP_DIR=${APP_DIR:-/opt/dynamic-fan-ui}
 SERVICE_NAME=${SERVICE_NAME:-dynamic-fans.service}
+UI_SERVICE_NAME=${UI_SERVICE_NAME:-dynamic-fan-ui.service}
 PYTHON=${PYTHON:-python3}
 
 prompt() {
@@ -27,6 +28,8 @@ ILO_SSH_KEY=${ILO_SSH_KEY:-/root/.ssh/ilo_key}
 ILO_PASSWORD=${ILO_PASSWORD:-}
 USE_IPMI_TEMPS=${USE_IPMI_TEMPS:-0}
 INSTALL_SYSTEMD=${INSTALL_SYSTEMD:-yes}
+ILO_SSH_LEGACY=${ILO_SSH_LEGACY:-0}
+START_NOW=${START_NOW:-yes}
 
 echo "\n=== ML350p-G8-Fan-controller Installer ==="
 prompt "iLO IP" "$ILO_IP" ILO_IP
@@ -43,14 +46,22 @@ echo ""
 read -r -p "Use IPMI for CPU temps (requires ipmitool)? (y/n) [n]: " use_ipmi
 use_ipmi=${use_ipmi:-n}
 if [[ "$use_ipmi" =~ ^[Yy]$ ]]; then USE_IPMI_TEMPS=1; else USE_IPMI_TEMPS=0; fi
+read -r -p "Enable legacy SSH algorithms for older iLO (fixes KEX error)? (y/n) [y]: " legacy
+legacy=${legacy:-y}
+if [[ "$legacy" =~ ^[Yy]$ ]]; then ILO_SSH_LEGACY=1; else ILO_SSH_LEGACY=0; fi
 read -r -p "Install and enable systemd service? (y/n) [y]: " sysd
 sysd=${sysd:-y}
 if [[ "$sysd" =~ ^[Yy]$ ]]; then INSTALL_SYSTEMD=yes; else INSTALL_SYSTEMD=no; fi
+read -r -p "Start services now after install? (y/n) [y]: " start_now
+start_now=${start_now:-y}
+if [[ "$start_now" =~ ^[Yy]$ ]]; then START_NOW=yes; else START_NOW=no; fi
 
 create_dirs() {
   echo "Creating directories..."
   sudo mkdir -p "$APP_DIR"
   sudo chown "${USER}:${USER}" "$APP_DIR"
+  sudo mkdir -p "$APP_DIR/app"
+  sudo chown -R "${USER}:${USER}" "$APP_DIR/app"
 }
 
 install_scripts() {
@@ -69,6 +80,37 @@ EOF
   [[ -f "$APP_DIR/fan_speeds.txt" ]] || : > "$APP_DIR/fan_speeds.txt"
 }
 
+install_ui() {
+  echo "Installing Flask UI to $APP_DIR/app..."
+  rsync -a --delete app.py "$APP_DIR/app/" 2>/dev/null || cp -f app.py "$APP_DIR/app/"
+  mkdir -p "$APP_DIR/app/static" "$APP_DIR/app/templates"
+  rsync -a static/ "$APP_DIR/app/static/" 2>/dev/null || cp -R static/* "$APP_DIR/app/static/" 2>/dev/null || true
+  rsync -a templates/ "$APP_DIR/app/templates/" 2>/dev/null || cp -R templates/* "$APP_DIR/app/templates/" 2>/dev/null || true
+
+  echo "Checking Python/Flask availability..."
+  if ! command -v $PYTHON >/dev/null 2>&1; then
+    echo "$PYTHON not found; attempting to install Python via package manager."
+    local mgr; mgr=$(detect_pkg_mgr)
+    case "$mgr" in
+      apt) sudo apt-get update -y && sudo apt-get install -y python3 python3-pip ;;
+      dnf) sudo dnf install -y python3 python3-pip ;;
+      yum) sudo yum install -y python3 python3-pip ;;
+      zypper) sudo zypper install -y python3 python3-pip ;;
+      pacman) sudo pacman -Sy --noconfirm python python-pip ;;
+      apk) sudo apk add --no-cache python3 py3-pip ;;
+      *) echo "Please install Python 3 and pip manually." ;;
+    esac
+  fi
+  if ! $PYTHON -c "import flask" >/dev/null 2>&1; then
+    echo "Installing Flask via pip..."
+    if command -v pip3 >/dev/null 2>&1; then
+      sudo -H pip3 install Flask || echo "Warning: failed to install Flask automatically. Install it manually (pip3 install Flask)."
+    else
+      echo "pip3 not found. Please install Flask manually (pip3 install Flask)."
+    fi
+  fi
+}
+
 install_systemd() {
   if ! command -v systemctl >/dev/null 2>&1; then
     echo "systemd not detected. Skipping service installation."; return 0
@@ -76,6 +118,10 @@ install_systemd() {
   echo "Installing systemd unit..."
   sudo install -m 0644 systemd/$SERVICE_NAME \
     	/etc/systemd/system/$SERVICE_NAME
+
+  echo "Installing UI systemd unit..."
+  sudo install -m 0644 systemd/$UI_SERVICE_NAME \
+    	/etc/systemd/system/$UI_SERVICE_NAME
 
   # Environment overrides file
   sudo mkdir -p /etc/systemd/system/$SERVICE_NAME.d
@@ -90,10 +136,27 @@ Environment=FAN_SPEED_FILE=$APP_DIR/fan_speeds.txt
 Environment=CHECK_INTERVAL=5
 Environment=MAX_STEP=10
 Environment=USE_IPMI_TEMPS=$USE_IPMI_TEMPS
+Environment=ILO_SSH_LEGACY=$ILO_SSH_LEGACY
+EOF
+
+  # UI overrides
+  sudo mkdir -p /etc/systemd/system/$UI_SERVICE_NAME.d
+  sudo bash -c "cat > /etc/systemd/system/$UI_SERVICE_NAME.d/override.conf" <<EOF
+[Service]
+Environment=FAN_CURVE_FILE=$APP_DIR/fan_curve.json
+Environment=FAN_SPEED_FILE=$APP_DIR/fan_speeds.txt
+Environment=ILO_IP=$ILO_IP
+Environment=ILO_USER=$ILO_USER
+Environment=ILO_SSH_KEY=$ILO_SSH_KEY
+Environment=ILO_PASSWORD=$ILO_PASSWORD
+Environment=USE_IPMI_TEMPS=$USE_IPMI_TEMPS
+Environment=ILO_SSH_LEGACY=$ILO_SSH_LEGACY
+WorkingDirectory=$APP_DIR/app
 EOF
 
   sudo systemctl daemon-reload
   sudo systemctl enable $SERVICE_NAME
+  sudo systemctl enable $UI_SERVICE_NAME
   echo "To start now: sudo systemctl start $SERVICE_NAME"
 }
 
@@ -174,12 +237,72 @@ Install complete.
 MSG
 }
 
+connectivity_check() {
+  echo "Testing iLO SSH connectivity..."
+  local ssh_base=(ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=3 -o ConnectionAttempts=1)
+  if [[ -n "$ILO_SSH_KEY" && -f "$ILO_SSH_KEY" ]]; then
+    ssh_base+=( -i "$ILO_SSH_KEY" )
+  fi
+  local cmd=("${ssh_base[@]}" "$ILO_USER@$ILO_IP" echo ok)
+  if [[ -n "$ILO_PASSWORD" && $(command -v sshpass) ]]; then
+    cmd=(sshpass -p "$ILO_PASSWORD" "${ssh_base[@]}" "$ILO_USER@$ILO_IP" echo ok)
+  fi
+  set +e
+  local out rc
+  out=$("${cmd[@]}" 2>/dev/null)
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 || "$out" != "ok" ]]; then
+    echo "Modern SSH failed; retrying with legacy algorithms..."
+    ssh_base+=(
+      -o KexAlgorithms=+diffie-hellman-group14-sha1 \
+      -o HostKeyAlgorithms=+ssh-rsa \
+      -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+      -o PubkeyAcceptedKeyTypes=+ssh-rsa \
+      -o Ciphers=+aes128-cbc
+    )
+    cmd=("${ssh_base[@]}" "$ILO_USER@$ILO_IP" echo ok)
+    if [[ -n "$ILO_PASSWORD" && $(command -v sshpass) ]]; then
+      cmd=(sshpass -p "$ILO_PASSWORD" "${ssh_base[@]}" "$ILO_USER@$ILO_IP" echo ok)
+    fi
+    set +e
+    out=$("${cmd[@]}" 2>/dev/null)
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 && "$out" == "ok" ]]; then
+      echo "Legacy SSH works. Enabling ILO_SSH_LEGACY=1."
+      ILO_SSH_LEGACY=1
+    else
+      echo "Warning: Unable to reach iLO via SSH. Verify IP/credentials and network."
+    fi
+  else
+    echo "iLO SSH connectivity OK."
+  fi
+}
+
+start_services() {
+  if ! command -v systemctl >/dev/null 2>&1; then return 0; fi
+  echo "Starting services..."
+  sudo systemctl start $SERVICE_NAME || true
+  sudo systemctl start $UI_SERVICE_NAME || true
+  echo "Service status (first lines):"
+  systemctl --no-pager --full status $SERVICE_NAME | sed -n '1,12p' || true
+  systemctl --no-pager --full status $UI_SERVICE_NAME | sed -n '1,12p' || true
+}
+
 main() {
   create_dirs
   install_prereqs
+  connectivity_check
   install_scripts
+  install_ui
   if [[ "$INSTALL_SYSTEMD" == "yes" ]]; then
     install_systemd
+    if [[ "$START_NOW" == "yes" ]]; then
+      start_services
+    else
+      echo "Skipping auto-start as requested."
+    fi
   else
     echo "Skipping systemd installation as requested."
   fi

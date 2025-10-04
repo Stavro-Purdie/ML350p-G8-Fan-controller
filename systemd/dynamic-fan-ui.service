@@ -1,25 +1,25 @@
 [Unit]
-Description=Dynamic Fan Control for HP ML350p Gen8
+Description=Dynamic Fan Web UI (Flask)
 After=network-online.target
 Wants=network-online.target
-Wants=dynamic-fan-ui.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/dynamic_fans.sh
+# For production, you might run via gunicorn; this simple unit uses Flask directly
+WorkingDirectory=/opt/dynamic-fan-ui/app
+ExecStart=/usr/bin/env python3 app.py
 Restart=always
 RestartSec=2
-# Environment overrides placed in /etc/systemd/system/dynamic-fans.service.d/override.conf
 Environment=FAN_CURVE_FILE=/opt/dynamic-fan-ui/fan_curve.json
 Environment=FAN_SPEED_FILE=/opt/dynamic-fan-ui/fan_speeds.txt
-Environment=CHECK_INTERVAL=5
-Environment=MAX_STEP=10
-# iLO auth defaults; override via override.conf for host-specific details
+# iLO config also used for temp reads
 Environment=ILO_IP=192.168.1.100
 Environment=ILO_USER=admin
 Environment=ILO_SSH_KEY=/root/.ssh/ilo_key
-# Optional password auth if sshpass available
+# Optional password
 # Environment=ILO_PASSWORD=
+# Optional IPMI temps
+# Environment=USE_IPMI_TEMPS=1
 
 [Install]
 WantedBy=multi-user.target
