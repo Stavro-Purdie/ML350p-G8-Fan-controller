@@ -18,6 +18,22 @@ ILO_SSH_TTY="${ILO_SSH_TTY:-1}"
 VERBOSE="${VERBOSE:-0}"
 ILO_SSH_TIMEOUT="${ILO_SSH_TIMEOUT:-12}"
 ILO_SSH_PERSIST="${ILO_SSH_PERSIST:-60}"
+ILO_CMD_GAP_MS="${ILO_CMD_GAP_MS:-75}"
+ILO_BATCH_SIZE="${ILO_BATCH_SIZE:-1}"
+# Simple millisecond sleep without external deps
+sleep_ms() {
+  local ms=$1
+  [[ -z "$ms" ]] && return
+  (( ms <= 0 )) && return
+  local s=$(( ms/1000 ))
+  local rem=$(( ms%1000 ))
+  if (( s > 0 )); then sleep $s; fi
+  if (( rem > 0 )); then
+    local frac
+    frac=$(printf "0.%03d" "$rem")
+    sleep "$frac"
+  fi
+}
 
 FAN_IDS=("fan1" "fan2" "fan3" "fan4" "fan5")
 # Allow overriding the base path(s) to fan objects
@@ -106,8 +122,8 @@ mkdir -p "$(dirname "$FAN_SPEED_FILE")" "$(dirname "$FAN_CURVE_FILE")"
 
 # Build SSH helper
 SSH_OPTS=("-o" "StrictHostKeyChecking=no")
-# Apply ConnectTimeout and keep-alives
-SSH_OPTS+=("-o" "ConnectTimeout=${ILO_SSH_TIMEOUT}" "-o" "ServerAliveInterval=5" "-o" "ServerAliveCountMax=2")
+# Apply ConnectTimeout, retries, and keep-alives
+SSH_OPTS+=("-o" "ConnectTimeout=${ILO_SSH_TIMEOUT}" "-o" "ConnectionAttempts=3" "-o" "ServerAliveInterval=5" "-o" "ServerAliveCountMax=2")
 # Reuse a control connection to avoid per-command handshake overhead
 SSH_OPTS+=("-o" "ControlMaster=auto" "-o" "ControlPath=/tmp/ssh-ilo-%C" "-o" "ControlPersist=${ILO_SSH_PERSIST}")
 if [[ -n "$ILO_SSH_KEY" && -f "$ILO_SSH_KEY" ]]; then
@@ -244,8 +260,9 @@ apply_fan_speed() {
     return $ok
   }
   if [[ "$ILO_MODDED" == "1" ]]; then
-    # Modded iLO: use "fan p <id> min YY" and "fan p <id> max YY" with YY in [1..255]
-    local cmd_chain=""
+    # Modded iLO: send max then min for each PID, with controlled pacing and optional small batching
+    local chunk_cmd=""
+    local chunk_count=0
     for idx in "${!P_IDS[@]}"; do
       local fan_id=${P_IDS[$idx]}
       local fan=${FAN_IDS[$idx]:-fan$fan_id}
@@ -267,14 +284,27 @@ apply_fan_speed() {
       local v255=$(( (NEW * 255 + 50) / 100 ))
       (( v255 < 1 )) && v255=1
       (( v255 > 255 )) && v255=255
-      # Batch commands to minimize SSH latency
-      cmd_chain+="fan p $fan_id max $v255; fan p $fan_id min $v255; "
+      # Append to current chunk (max then min)
+      chunk_cmd+="fan p $fan_id max $v255; fan p $fan_id min $v255; "
+      ((chunk_count++))
+      # Send when chunk full
+      if (( chunk_count >= ILO_BATCH_SIZE )); then
+        if ! ssh_ilo "$chunk_cmd" >/dev/null 2>&1; then
+          echo "WARN: Batch fan set failed (chunk)" >&2
+        fi
+        # separation between batches
+        sleep_ms "$ILO_CMD_GAP_MS"
+        chunk_cmd=""
+        chunk_count=0
+      fi
       LAST_SPEEDS[$fan]=$NEW
     done
-    if [[ -n "$cmd_chain" ]]; then
-      if ! ssh_ilo "$cmd_chain" >/dev/null 2>&1; then
-        echo "WARN: Batch fan set failed" >&2
+    # Flush remainder
+    if [[ -n "$chunk_cmd" ]]; then
+      if ! ssh_ilo "$chunk_cmd" >/dev/null 2>&1; then
+        echo "WARN: Batch fan set failed (final)" >&2
       fi
+      sleep_ms "$ILO_CMD_GAP_MS"
     fi
   else
     for fan in "${FAN_IDS[@]}"; do
@@ -297,6 +327,8 @@ apply_fan_speed() {
     if ! ilo_set_speed "$fan" "$NEW"; then
       echo "WARN: Failed to set $fan to $NEW" >&2
     fi
+    # separation between per-fan sets
+    sleep_ms "$ILO_CMD_GAP_MS"
     LAST_SPEEDS[$fan]=$NEW
     done
   fi

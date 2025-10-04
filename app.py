@@ -29,13 +29,21 @@ except Exception:
 ILO_FAN_PROP = os.getenv("ILO_FAN_PROP", "")
 ILO_SSH_TTY = os.getenv("ILO_SSH_TTY", "1") == "1"  # some iLO shells require a TTY
 try:
-    ILO_SSH_TIMEOUT = int(os.getenv("ILO_SSH_TIMEOUT", "12"))
+    ILO_SSH_TIMEOUT = int(os.getenv("ILO_SSH_TIMEOUT", "20"))
 except Exception:
-    ILO_SSH_TIMEOUT = 12
+    ILO_SSH_TIMEOUT = 20
 try:
     ILO_SSH_PERSIST = int(os.getenv("ILO_SSH_PERSIST", "60"))  # seconds to keep control connection alive
 except Exception:
     ILO_SSH_PERSIST = 60
+try:
+    ILO_CMD_GAP_MS = int(os.getenv("ILO_CMD_GAP_MS", "75"))
+except Exception:
+    ILO_CMD_GAP_MS = 75
+try:
+    ILO_BATCH_SIZE = int(os.getenv("ILO_BATCH_SIZE", "1"))
+except Exception:
+    ILO_BATCH_SIZE = 1
 
 # iLO fan object search paths and property candidates
 FAN_PATHS = ["/system1", "/system1/fans1"]
@@ -112,6 +120,10 @@ def _build_ssh_base():
     base = [
         "ssh",
         "-o", "StrictHostKeyChecking=no",
+        # Fewer flakes: retry TCP connect and keep the session alive
+        "-o", "ConnectionAttempts=3",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=2",
         # Reuse a control connection to avoid per-command handshake overhead
         "-o", "ControlMaster=auto",
         "-o", "ControlPath=/tmp/ssh-ilo-%C",
@@ -202,6 +214,21 @@ def _ilo_run(cmd: str, timeout: int | None = None) -> str:
     out = res.stdout or ""
     _ILO_RECENT.append({"ts": time.time(), "cmd": cmd, "rc": 0, "ms": int((time.time()-t0)*1000), "out": (out + (res.stderr or ""))[-2000:]})
     return out
+
+
+def _ilo_try(cmd: str, attempts: int = 2, timeout: int | None = None) -> str:
+    last_err: Exception | None = None
+    for i in range(max(1, attempts)):
+        try:
+            return _ilo_run(cmd, timeout=timeout)
+        except Exception as e:
+            last_err = e
+            # Short backoff before retrying
+            time.sleep(0.5)
+            continue
+    if last_err:
+        raise last_err
+    return ""
 
 
 def _discover_fans() -> list[str]:
@@ -617,12 +644,33 @@ def _run_quick_test(percent: int, duration: int):
         # Apply requested percent
         if ILO_MODDED:
             pids = _compute_pids(fans)
-            # Batch commands
-            cmds = "; ".join([f"fan p {pid} max {max(1, min(255, (max(0, min(100, int(percent))) * 255 + 50)//100))}; fan p {pid} min {max(1, min(255, (max(0, min(100, int(percent))) * 255 + 50)//100))}" for pid in pids])
-            try:
-                _ilo_run(cmds, timeout=8)
-            except Exception:
-                pass
+            # Chunked commands with pacing to avoid overloading iLO
+            def pct_to_255(p: int) -> int:
+                v = max(0, min(100, int(p)))
+                return max(1, min(255, (v * 255 + 50) // 100))
+            v255 = pct_to_255(percent)
+            chunk: list[str] = []
+            count = 0
+            for pid in pids:
+                chunk.append(f"fan p {pid} max {v255}; fan p {pid} min {v255}")
+                count += 1
+                if count >= max(1, ILO_BATCH_SIZE):
+                    try:
+                        _ilo_run("; ".join(chunk), timeout=8)
+                    except Exception:
+                        pass
+                    # separation between batches
+                    try:
+                        time.sleep(max(0.0, ILO_CMD_GAP_MS/1000.0))
+                    except Exception:
+                        pass
+                    chunk = []
+                    count = 0
+            if chunk:
+                try:
+                    _ilo_run("; ".join(chunk), timeout=8)
+                except Exception:
+                    pass
         else:
             # Try detected prop/path; fallback across candidates
             prop, path = _detect_fan_prop()
@@ -675,27 +723,11 @@ def fan_test():
 @app.route("/test_ilo")
 def test_ilo():
     method = "ssh"
-    cmd = ["ssh", "-o", "StrictHostKeyChecking=no"]
-    if ILO_SSH_LEGACY:
-        cmd += [
-            "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1",
-            "-o", "HostKeyAlgorithms=+ssh-rsa",
-            "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
-            "-o", "PubkeyAcceptedKeyTypes=+ssh-rsa",
-            "-o", "Ciphers=+aes128-cbc,3des-cbc",
-            "-o", "MACs=+hmac-sha1",
-        ]
-    if ILO_SSH_KEY and os.path.exists(ILO_SSH_KEY):
-        cmd += ["-i", ILO_SSH_KEY]
-        method = "ssh-key"
-    if ILO_PASSWORD:
-        cmd = ["sshpass", "-p", ILO_PASSWORD] + cmd
-        method = "sshpass"
-    cmd += [f"{ILO_USER}@{ILO_IP}", "echo ok"]
     try:
-        out = _ilo_run("echo ok")
-        ok_flag = (out.strip().lower().find("ok") != -1)
-        return jsonify({"ok": ok_flag, "method": method, "output": out.strip()})
+        out = _ilo_try("echo ok", attempts=3, timeout=int(ILO_SSH_TIMEOUT * 1.5))
+        text = (out or "").strip().lower()
+        ok_flag = ("ok" in text) or ("connection to" in text and "closed" in text)
+        return jsonify({"ok": ok_flag, "method": ("sshpass" if ILO_PASSWORD else ("ssh-key" if (ILO_SSH_KEY and os.path.exists(ILO_SSH_KEY)) else "ssh")), "output": (out or "").strip()})
     except Exception as e:
         return jsonify({"ok": False, "method": method, "error": str(e)}), 500
 
