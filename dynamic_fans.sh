@@ -12,7 +12,9 @@ ILO_PASSWORD="${ILO_PASSWORD:-}"
 USE_IPMI_TEMPS="${USE_IPMI_TEMPS:-0}"
 # Enable legacy SSH algorithms for older iLO (OpenSSH 8.8+ compatibility)
 ILO_SSH_LEGACY="${ILO_SSH_LEGACY:-0}"
-ILO_MODDED="${ILO_MODDED:-0}"
+# Force modded mode fixed ON
+ILO_MODDED="${ILO_MODDED:-1}"
+ILO_MODDED="1"
 ILO_PID_OFFSET="${ILO_PID_OFFSET:--1}"
 ILO_SSH_TTY="${ILO_SSH_TTY:-1}"
 VERBOSE="${VERBOSE:-0}"
@@ -75,7 +77,8 @@ if (( ${#P_IDS[@]} == 0 )); then
   for f in "${FAN_IDS[@]}"; do
     if [[ "$f" =~ ^fan([0-9]+)$ ]]; then
       num=${BASH_REMATCH[1]}
-      pid=$(( num + ILO_PID_OFFSET ))
+      # User mapping: ssh fan N corresponds to physical P-ID N+1
+      pid=$(( num + 1 + ILO_PID_OFFSET ))
       (( pid < 0 )) && pid=0
       P_IDS+=("$pid")
     fi
@@ -256,9 +259,7 @@ apply_fan_speed() {
     return $ok
   }
   if [[ "$ILO_MODDED" == "1" ]]; then
-    # Modded iLO: send max then min for each PID, with controlled pacing and optional small batching
-    local chunk_cmd=""
-    local chunk_count=0
+    # Modded iLO: send max then min for each PID as separate commands with pacing
     for idx in "${!P_IDS[@]}"; do
       local fan_id=${P_IDS[$idx]}
       local fan=${FAN_IDS[$idx]:-fan$fan_id}
@@ -285,31 +286,20 @@ apply_fan_speed() {
         # min is 8 steps below max (clamped)
         local vmin=$(( v255 - 8 ))
         (( vmin < 1 )) && vmin=1
-        # Append to current chunk (max then min)
-        chunk_cmd+="fan p $fan_id max $v255; fan p $fan_id min $vmin; "
-        ((chunk_count++))
+        # Send exact control as two separate commands with small gap (matches working pattern)
+        if ! ssh_ilo "fan p $fan_id max $v255" >/dev/null 2>&1; then
+          echo "WARN: Failed: fan p $fan_id max $v255" >&2
+        fi
+        sleep_ms "$ILO_CMD_GAP_MS"
+        if ! ssh_ilo "fan p $fan_id min $vmin" >/dev/null 2>&1; then
+          echo "WARN: Failed: fan p $fan_id min $vmin" >&2
+        fi
+        sleep_ms "$ILO_CMD_GAP_MS"
         ((updates_sent++))
         updated_pids+=("$fan_id")
       fi
-      # Send when chunk full
-      if (( chunk_count >= ILO_BATCH_SIZE )); then
-        if ! ssh_ilo "$chunk_cmd" >/dev/null 2>&1; then
-          echo "WARN: Batch fan set failed (chunk)" >&2
-        fi
-        # separation between batches
-        sleep_ms "$ILO_CMD_GAP_MS"
-        chunk_cmd=""
-        chunk_count=0
-      fi
       LAST_SPEEDS[$fan]=$NEW
     done
-    # Flush remainder
-    if [[ -n "$chunk_cmd" ]]; then
-      if ! ssh_ilo "$chunk_cmd" >/dev/null 2>&1; then
-        echo "WARN: Batch fan set failed (final)" >&2
-      fi
-      sleep_ms "$ILO_CMD_GAP_MS"
-    fi
   else
     for fan in "${FAN_IDS[@]}"; do
     CURRENT=${LAST_SPEEDS[$fan]:-20}

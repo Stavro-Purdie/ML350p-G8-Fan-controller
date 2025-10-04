@@ -22,7 +22,8 @@ ILO_IP = os.getenv("ILO_IP", "192.168.1.100")
 ILO_PASSWORD = os.getenv("ILO_PASSWORD", "")
 USE_IPMI_TEMPS = os.getenv("USE_IPMI_TEMPS", "0") == "1"
 ILO_SSH_LEGACY = os.getenv("ILO_SSH_LEGACY", "0") == "1"
-ILO_MODDED = os.getenv("ILO_MODDED", "0") == "1"
+# Force modded mode fixed ON
+ILO_MODDED = True
 try:
     ILO_PID_OFFSET = int(os.getenv("ILO_PID_OFFSET", "-1"))
 except Exception:
@@ -364,7 +365,8 @@ def _compute_pids(fans: List[str]) -> List[int]:
         for f in fans:
             m = re.search(r"(\d+)", f)
             if m:
-                pid = int(m.group(1)) + (ILO_PID_OFFSET or 0)
+                # User reports ssh fan N is physical N+1; adjust by +1 in addition to configured offset
+                pid = int(m.group(1)) + 1 + (ILO_PID_OFFSET or 0)
             else:
                 pid = 0
             if pid < 0:
@@ -416,7 +418,7 @@ def ilo_set_speed_percent_normal(fan: str, percent: int) -> bool:
 
 
 def ilo_set_speed_percent_modded(pid: int, percent: int) -> bool:
-    """Set exact fan min=max in 1..255 domain for modded iLO."""
+    """Set exact fan using separate max then min commands (1..255) for modded iLO."""
     v = max(0, min(100, int(percent)))
     v255 = max(1, min(255, (v * 255 + 50) // 100))
     vmin = max(1, v255 - 8)  # min 8 steps below max to avoid iLO quirks
@@ -703,31 +705,27 @@ def _run_quick_test(percent: int, duration: int):
         # Apply requested percent
         if ILO_MODDED:
             pids = _compute_pids(fans)
-            # Chunked commands with pacing to avoid overloading iLO
             def pct_to_255(p: int) -> int:
                 v = max(0, min(100, int(p)))
                 return max(1, min(255, (v * 255 + 50) // 100))
             v255 = pct_to_255(percent)
-            chunk: list[str] = []
-            count = 0
+            vmin = max(1, v255 - 8)
+            # Send separate commands per PID with small pacing gap (matches working pattern)
             for pid in pids:
-                chunk.append(f"fan p {pid} max {v255}; fan p {pid} min {v255}")
-                count += 1
-                if count >= max(1, ILO_BATCH_SIZE):
-                    try:
-                        _ilo_run("; ".join(chunk), timeout=8)
-                    except Exception:
-                        pass
-                    # separation between batches
-                    try:
-                        time.sleep(max(0.0, ILO_CMD_GAP_MS/1000.0))
-                    except Exception:
-                        pass
-                    chunk = []
-                    count = 0
-            if chunk:
                 try:
-                    _ilo_run("; ".join(chunk), timeout=8)
+                    _ilo_run(f"fan p {pid} max {v255}", timeout=8)
+                except Exception:
+                    pass
+                try:
+                    time.sleep(max(0.0, ILO_CMD_GAP_MS/1000.0))
+                except Exception:
+                    pass
+                try:
+                    _ilo_run(f"fan p {pid} min {vmin}", timeout=8)
+                except Exception:
+                    pass
+                try:
+                    time.sleep(max(0.0, ILO_CMD_GAP_MS/1000.0))
                 except Exception:
                     pass
         else:
