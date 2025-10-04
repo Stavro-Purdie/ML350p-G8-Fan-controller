@@ -15,6 +15,7 @@ ILO_SSH_LEGACY="${ILO_SSH_LEGACY:-0}"
 ILO_MODDED="${ILO_MODDED:-0}"
 ILO_PID_OFFSET="${ILO_PID_OFFSET:--1}"
 ILO_SSH_TTY="${ILO_SSH_TTY:-1}"
+VERBOSE="${VERBOSE:-0}"
 
 FAN_IDS=("fan1" "fan2" "fan3" "fan4" "fan5")
 # Allow overriding the base path(s) to fan objects
@@ -71,22 +72,9 @@ detect_fan_prop() {
     local out
     out=$(ssh_ilo "show -a $prefix/$fan_sample" 2>/dev/null || ssh_ilo "show $prefix/$fan_sample" 2>/dev/null || true)
     if [[ -z "$out" ]]; then continue; fi
-    # Look for key=value style fields with names containing speed/pwm/duty and numeric 0-100
-    prop=$(echo "$out" | awk '
-      BEGIN{IGNORECASE=1}
-      {
-        # split on separators
-        n=split($0, a, /[=:]/);
-        if (n>=2) {
-          key=a[1]; val=a[2];
-          gsub(/^[ \\t]+|[ \\t]+$/, "", key);
-          gsub(/^[ \\t]+|[ \\t]+$/, "", val);
-          if (key ~ /(speed|pwm|duty)/ && match(val, /[0-9]{1,3}/, m)) {
-            v=m[0]+0; if (v>=0 && v<=100) { print tolower(key); exit; }
-          }
-        }
-      }
-    ' | head -1)
+    # Look for key=value style fields with names containing speed/pwm/duty
+    prop=$(echo "$out" | tr -d '\r' | grep -iE 'speed|pwm|duty' | head -1 \
+      | sed -E 's/^[[:space:]]*([^:=[:space:]]+)[[:space:]]*[:=].*/\1/i' | tr '[:upper:]' '[:lower:]')
     if [[ -n "$prop" ]]; then
       echo "Detected fan property: $prop on $prefix/$fan_sample" >&2
       ILO_FAN_PROP="$prop"
@@ -135,16 +123,21 @@ if [[ "$ILO_SSH_TTY" == "1" || "$ILO_MODDED" == "1" ]]; then
 fi
 ssh_ilo() {
   local cmd=$1
+  [[ "$VERBOSE" == "1" ]] && echo "[ssh_ilo] CMD: $cmd" >&2
+  local output rc
   if [[ -n "$ILO_PASSWORD" ]]; then
     if command -v sshpass >/dev/null 2>&1; then
-      sshpass -p "$ILO_PASSWORD" ssh "${SSH_OPTS[@]}" "$ILO_USER@$ILO_IP" "$cmd"
+      output=$(sshpass -p "$ILO_PASSWORD" ssh "${SSH_OPTS[@]}" "$ILO_USER@$ILO_IP" "$cmd" 2>&1); rc=$?
     else
       echo "sshpass not found but ILO_PASSWORD is set; install sshpass or use key-based auth" >&2
       return 1
     fi
   else
-    ssh -o BatchMode=yes "${SSH_OPTS[@]}" "$ILO_USER@$ILO_IP" "$cmd"
+    output=$(ssh -o BatchMode=yes "${SSH_OPTS[@]}" "$ILO_USER@$ILO_IP" "$cmd" 2>&1); rc=$?
   fi
+  [[ "$VERBOSE" == "1" ]] && echo "[ssh_ilo] OUT: ${output//$'\n'/ } (rc=$rc)" >&2
+  printf "%s" "$output"
+  return $rc
 }
 
 # Load previous fan speeds if available
@@ -172,26 +165,19 @@ fi
 get_cpu_temp() {
   if [[ "$USE_IPMI_TEMPS" == "1" && -n "$ILO_IP" && -n "$ILO_USER" ]]; then
     if command -v ipmitool >/dev/null 2>&1; then
-      # Read highest CPU temperature via SDRs; prefer values with trailing C or 'degrees C'
+      # Read highest CPU temperature via SDRs (fallback-friendly)
       ipmitool -I lanplus -H "$ILO_IP" -U "$ILO_USER" ${ILO_PASSWORD:+-P "$ILO_PASSWORD"} sdr type Temperature \
-        | awk '
-          ($0 ~ /[Cc][Pp][Uu]|[Pp]roc|[Pp]rocessor/) {
-            if (match($0, /([0-9]+)[ ]*[Cc]/, m)) { print m[1]; }
-            else if (match($0, /([0-9]+)/, m)) { print m[1]; }
-          }
-        ' | sort -nr | head -1
+        | grep -Ei 'cpu|proc|processor' \
+        | sed -n -E 's/.*([0-9]{1,3})[ ]*[Cc]?.*/\1/p' \
+        | sort -nr | head -1
       return
     fi
   fi
   # Fallback to iLO sensors over SSH; prefer values with trailing C
-  ssh_ilo "show /system1/sensors" | awk '
-    ($0 ~ /[Cc][Pp][Uu]|[Pp]roc|[Pp]rocessor/) {
-      if (match($0, /([0-9]+)[ ]*[Cc]/, m)) { print m[1]; }
-      else {
-        for (i=1;i<=NF;i++) if (match($i, /^([0-9]+)$/, n)) print n[1];
-      }
-    }
-  ' | sort -nr | head -1
+  ssh_ilo "show /system1/sensors" \
+    | grep -Ei 'cpu|proc|processor' \
+    | sed -n -E 's/.*([0-9]{1,3})[ ]*[Cc]?.*/\1/p' \
+    | sort -nr | head -1
 }
 
 get_gpu_temp() {
@@ -248,6 +234,7 @@ apply_fan_speed() {
   }
   if [[ "$ILO_MODDED" == "1" ]]; then
     # Modded iLO: use "fan p <id> min YY" and "fan p <id> max YY" with YY in [1..255]
+    local cmd_chain=""
     for idx in "${!P_IDS[@]}"; do
       local fan_id=${P_IDS[$idx]}
       local fan=${FAN_IDS[$idx]:-fan$fan_id}
@@ -269,16 +256,15 @@ apply_fan_speed() {
       local v255=$(( (NEW * 255 + 50) / 100 ))
       (( v255 < 1 )) && v255=1
       (( v255 > 255 )) && v255=255
-      # Set exact control: max first, then min = max = v255 (more reliable on some builds)
-      if ! ssh_ilo "fan p $fan_id max $v255" >/dev/null 2>&1; then
-        echo "WARN: Failed to set fan p $fan_id max=$v255" >&2
-      fi
-      sleep 0.1
-      if ! ssh_ilo "fan p $fan_id min $v255" >/dev/null 2>&1; then
-        echo "WARN: Failed to set fan p $fan_id min=$v255" >&2
-      fi
+      # Batch commands to minimize SSH latency
+      cmd_chain+="fan p $fan_id max $v255; fan p $fan_id min $v255; "
       LAST_SPEEDS[$fan]=$NEW
     done
+    if [[ -n "$cmd_chain" ]]; then
+      if ! ssh_ilo "$cmd_chain" >/dev/null 2>&1; then
+        echo "WARN: Batch fan set failed" >&2
+      fi
+    fi
   else
     for fan in "${FAN_IDS[@]}"; do
     CURRENT=${LAST_SPEEDS[$fan]:-20}
@@ -339,9 +325,10 @@ while true; do
   fi
   (( FAN_TARGET < 0 )) && FAN_TARGET=0
   (( FAN_TARGET > 100 )) && FAN_TARGET=100
+  [[ "$VERBOSE" == "1" ]] && echo "[loop] CPU=$CPU_TEMP GPU=$GPU_TEMP -> target=$FAN_TARGET" >&2
   apply_fan_speed $FAN_TARGET
-  # Log a lightweight heartbeat for diagnostics (visible in journalctl)
-  echo "CPU=${CPU_TEMP}C GPU=${GPU_TEMP}C -> target=${FAN_TARGET}% speeds=[${FAN_IDS[*]}]" | sed 's/ /,/g' >&2
+  # Heartbeat for diagnostics
+  echo "CPU=${CPU_TEMP}C GPU=${GPU_TEMP}C target=${FAN_TARGET}%" >&2
   # Optional runtime overrides from JSON
   if command -v jq >/dev/null 2>&1; then
     CI=$(jq -r '(.checkInterval // empty)' "$FAN_CURVE_FILE" 2>/dev/null || true)

@@ -1,0 +1,19 @@
+[Unit]
+Description=Dynamic Fan Control for HP ML350p Gen8
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dynamic_fans.sh
+Restart=always
+RestartSec=2
+Environment=ILO_IP=192.168.1.100 ILO_USER=admin ILO_PASSWORD=changeme
+Environment=ILO_SSH_LEGACY=1 ILO_SSH_TTY=1
+Environment=ILO_MODDED=1 ILO_PID_OFFSET=-1
+Environment=FAN_SPEED_FILE=/opt/dynamic-fan-ui/fan_speeds.txt FAN_CURVE_FILE=/opt/dynamic-fan-ui/fan_curve.json
+Environment=USE_IPMI_TEMPS=0 VERBOSE=1
+# Example explicit PID mapping instead of offset:
+# Environment=FAN_P_IDS_STR=1 2 3 4 5
+
+[Install]
+WantedBy=multi-user.target

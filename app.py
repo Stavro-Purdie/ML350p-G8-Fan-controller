@@ -528,7 +528,16 @@ def _run_quick_test(percent: int, duration: int):
         # Stop control loop so it doesn't fight the test
         if shutil.which("systemctl"):
             try:
-                subprocess.check_output(["systemctl", "stop", "dynamic-fans.service"], text=True, timeout=6)
+                subprocess.check_output(["systemctl", "stop", "dynamic-fans.service"], text=True, timeout=10)
+                # Wait briefly for the process to actually exit
+                for _ in range(10):
+                    try:
+                        state = subprocess.check_output(["systemctl", "is-active", "dynamic-fans.service"], text=True, timeout=2).strip()
+                        if state != "active":
+                            break
+                    except Exception:
+                        break
+                    time.sleep(0.2)
             except Exception:
                 pass
         # Discover fans and optionally P-IDs
@@ -536,17 +545,30 @@ def _run_quick_test(percent: int, duration: int):
         # Apply requested percent
         if ILO_MODDED:
             pids = _compute_pids(fans)
-            for pid in pids:
-                try:
-                    ilo_set_speed_percent_modded(pid, percent)
-                except Exception:
-                    continue
+            # Batch commands
+            cmds = "; ".join([f"fan p {pid} max {max(1, min(255, (max(0, min(100, int(percent))) * 255 + 50)//100))}; fan p {pid} min {max(1, min(255, (max(0, min(100, int(percent))) * 255 + 50)//100))}" for pid in pids])
+            try:
+                _ilo_run(cmds, timeout=8)
+            except Exception:
+                pass
         else:
+            # Try detected prop/path; fallback across candidates
+            prop, path = _detect_fan_prop()
+            candidates = [prop] if prop else []
+            for c in ["speed","pwm","duty","duty_cycle","fan_speed","percentage"]:
+                if c not in candidates:
+                    candidates.append(c)
             for fan in fans:
-                try:
-                    ilo_set_speed_percent_normal(fan, percent)
-                except Exception:
-                    continue
+                ok = False
+                for pr in candidates:
+                    for prefix in ([path] if path else []) + [p for p in ["/system1","/system1/fans1"] if p != path]:
+                        try:
+                            _ilo_run(f"set {prefix}/{fan} {pr}={int(percent)}", timeout=4)
+                            ok = True
+                            break
+                        except Exception:
+                            continue
+                    if ok: break
         # Reflect immediately in speed file for UI
         try:
             speeds = [max(0, min(100, int(percent))) for _ in fans]
