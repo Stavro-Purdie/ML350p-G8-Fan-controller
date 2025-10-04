@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, redirect, jsonify
 import json, os, subprocess, re, time, threading, shutil
 from collections import deque
+from typing import Optional, List, Tuple
 
 app = Flask(__name__)
 
@@ -97,7 +98,7 @@ def load_curve():
 
 
 def get_fan_speeds():
-    vals: list[int] = []
+    vals: List[int] = []
     try:
         if os.path.exists(FAN_SPEED_FILE):
             with open(FAN_SPEED_FILE) as f:
@@ -147,10 +148,10 @@ def _build_ssh_base():
 
 # ---------------- iLO helpers: discovery and control ----------------
 _detect_lock = threading.Lock()
-_DISCOVERED_FANS: list[str] | None = None
-_DETECTED_PROP: str | None = None
-_DETECTED_PATH: str | None = None
-_COMPUTED_PIDS: list[int] | None = None
+_DISCOVERED_FANS: Optional[List[str]] = None
+_DETECTED_PROP: Optional[str] = None
+_DETECTED_PATH: Optional[str] = None
+_COMPUTED_PIDS: Optional[List[int]] = None
 _ILO_RECENT = deque(maxlen=200)
 
 
@@ -164,7 +165,7 @@ def _load_ui_config():
     return {}
 
 
-def _apply_ui_overrides(cfg: dict | None = None):
+def _apply_ui_overrides(cfg: Optional[dict] = None):
     global ILO_SSH_LEGACY, ILO_SSH_TTY, ILO_SSH_TIMEOUT, ILO_SSH_PERSIST
     global ILO_MODDED, ILO_PID_OFFSET, _EXPLICIT_PIDS, ILO_FAN_PROP
     if cfg is None:
@@ -197,7 +198,7 @@ def _apply_ui_overrides(cfg: dict | None = None):
 _apply_ui_overrides()
 
 
-def _ilo_run(cmd: str, timeout: int | None = None) -> str:
+def _ilo_run(cmd: str, timeout: Optional[int] = None) -> str:
     if timeout is None:
         timeout = ILO_SSH_TIMEOUT
     base = _build_ssh_base()
@@ -216,8 +217,8 @@ def _ilo_run(cmd: str, timeout: int | None = None) -> str:
     return out
 
 
-def _ilo_try(cmd: str, attempts: int = 2, timeout: int | None = None) -> str:
-    last_err: Exception | None = None
+def _ilo_try(cmd: str, attempts: int = 2, timeout: Optional[int] = None) -> str:
+    last_err: Optional[Exception] = None
     for i in range(max(1, attempts)):
         try:
             return _ilo_run(cmd, timeout=timeout)
@@ -231,12 +232,12 @@ def _ilo_try(cmd: str, attempts: int = 2, timeout: int | None = None) -> str:
     return ""
 
 
-def _discover_fans() -> list[str]:
+def _discover_fans() -> List[str]:
     global _DISCOVERED_FANS
     with _detect_lock:
         if _DISCOVERED_FANS is not None:
             return _DISCOVERED_FANS
-        found: list[str] = []
+        found: List[str] = []
         # Prefer concise 'fans show' listing if available
         try:
             out = _ilo_run("fans show")
@@ -262,7 +263,7 @@ def _discover_fans() -> list[str]:
         return _DISCOVERED_FANS
 
 
-def _detect_fan_prop() -> tuple[str | None, str | None]:
+def _detect_fan_prop() -> Tuple[Optional[str], Optional[str]]:
     """Return (prop, path) to use for normal iLO percent setting, or (None,None)."""
     global _DETECTED_PROP, _DETECTED_PATH
     with _detect_lock:
@@ -351,7 +352,7 @@ def _detect_fan_prop() -> tuple[str | None, str | None]:
         return None, None
 
 
-def _compute_pids(fans: list[str]) -> list[int]:
+def _compute_pids(fans: List[str]) -> List[int]:
     global _COMPUTED_PIDS
     with _detect_lock:
         if _COMPUTED_PIDS is not None:
@@ -359,7 +360,7 @@ def _compute_pids(fans: list[str]) -> list[int]:
         if _EXPLICIT_PIDS:
             _COMPUTED_PIDS = _EXPLICIT_PIDS
             return _COMPUTED_PIDS
-        pids: list[int] = []
+        pids: List[int] = []
         for f in fans:
             m = re.search(r"(\d+)", f)
             if m:
@@ -375,6 +376,7 @@ def _compute_pids(fans: list[str]) -> list[int]:
 
 def ilo_set_speed_percent_normal(fan: str, percent: int) -> bool:
     """Set percent via property on fan object."""
+    global _DETECTED_PROP, _DETECTED_PATH
     prop, path = _detect_fan_prop()
     candidates = [prop] if prop else []
     for c in PROP_CANDIDATES:
@@ -388,7 +390,6 @@ def ilo_set_speed_percent_normal(fan: str, percent: int) -> bool:
                 _ilo_run(f"set {prefix}/{fan} {pr}={percent}")
                 # Cache success
                 with _detect_lock:
-                    global _DETECTED_PROP, _DETECTED_PATH
                     _DETECTED_PROP, _DETECTED_PATH = pr, prefix
                 return True
             except Exception:
@@ -401,7 +402,6 @@ def ilo_set_speed_percent_normal(fan: str, percent: int) -> bool:
             try:
                 _ilo_run(f"fans {num} {pr}={percent}")
                 with _detect_lock:
-                    global _DETECTED_PROP, _DETECTED_PATH
                     _DETECTED_PROP, _DETECTED_PATH = pr, "fans"
                 return True
             except Exception:
