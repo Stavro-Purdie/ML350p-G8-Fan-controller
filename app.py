@@ -284,8 +284,44 @@ def index():
             fan_curve["gpuBoost"] = {}
     except Exception:
         pass
-    return render_template("index.html", cpu_temp=cpu_temp, gpu_temp=gpu_temp,
-                           fan_speeds=fan_speeds, fan_curve=fan_curve)
+    # Prepare flat values for template to avoid nested access
+    blend = fan_curve.get("blend", {}) if isinstance(fan_curve.get("blend"), dict) else {}
+    blend_mode = blend.get("mode", "max")
+    try:
+        cpu_w = float(blend.get("cpuWeight", 0.5))
+    except Exception:
+        cpu_w = 0.5
+    try:
+        gpu_w = float(blend.get("gpuWeight", 0.5))
+    except Exception:
+        gpu_w = 0.5
+
+    gpu_curve = fan_curve.get("gpu", {}) if isinstance(fan_curve.get("gpu"), dict) else {}
+    gpu_minTemp = gpu_curve.get("minTemp", "")
+    gpu_maxTemp = gpu_curve.get("maxTemp", "")
+    gpu_minSpeed = gpu_curve.get("minSpeed", "")
+    gpu_maxSpeed = gpu_curve.get("maxSpeed", "")
+
+    gb = fan_curve.get("gpuBoost", {}) if isinstance(fan_curve.get("gpuBoost"), dict) else {}
+    gb_t = gb.get("threshold", "")
+    gb_a = gb.get("add", 0)
+
+    return render_template(
+        "index.html",
+        cpu_temp=cpu_temp,
+        gpu_temp=gpu_temp,
+        fan_speeds=fan_speeds,
+        fan_curve=fan_curve,
+        blend_mode=blend_mode,
+        cpu_w=cpu_w,
+        gpu_w=gpu_w,
+        gpu_minTemp=gpu_minTemp,
+        gpu_maxTemp=gpu_maxTemp,
+        gpu_minSpeed=gpu_minSpeed,
+        gpu_maxSpeed=gpu_maxSpeed,
+        gb_t=gb_t,
+        gb_a=gb_a,
+    )
 
 @app.route("/control", methods=["POST"])
 def control():
