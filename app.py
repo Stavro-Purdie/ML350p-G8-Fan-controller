@@ -33,9 +33,9 @@ ILO_FAN_PROP = os.getenv("ILO_FAN_PROP", "")
 ILO_SSH_TTY = os.getenv("ILO_SSH_TTY", "1") == "1"  # some iLO shells require a TTY
 PWM_UNITS = os.getenv("PWM_UNITS", "bits")
 try:
-    ILO_SSH_TIMEOUT = int(os.getenv("ILO_SSH_TIMEOUT", "20"))
+    ILO_SSH_TIMEOUT = int(os.getenv("ILO_SSH_TIMEOUT", "320"))
 except Exception:
-    ILO_SSH_TIMEOUT = 20
+    ILO_SSH_TIMEOUT = 320
 try:
     ILO_SSH_PERSIST = int(os.getenv("ILO_SSH_PERSIST", "60"))  # seconds to keep control connection alive
 except Exception:
@@ -195,6 +195,59 @@ _COMPUTED_PIDS: Optional[List[int]] = None
 _ILO_RECENT = deque(maxlen=200)
 _ILO_ACTUALS = {"ts": 0.0, "map": {}}
 
+# Cross-process lock path to coordinate with the daemon (dynamic_fans.sh)
+_ILO_LOCK_FILE = os.getenv("ILO_LOCK_FILE", "/opt/dynamic-fan-ui/ilo.lock")
+
+# Prioritized command scheduler to avoid concurrent iLO commands from the web app
+import queue, fcntl
+class _CmdItem:
+    __slots__ = ("prio","seq","cmd","timeout","event","out","err")
+    prio: int
+    seq: int
+    cmd: str
+    timeout: int
+    event: threading.Event
+    out: Optional[str]
+    err: Optional[Exception]
+    def __init__(self, prio:int, seq:int, cmd:str, timeout:int):
+        self.prio=prio; self.seq=seq; self.cmd=cmd; self.timeout=timeout
+        self.event=threading.Event(); self.out=None; self.err=None
+    def __lt__(self, other):
+        return (self.prio, self.seq) < (other.prio, other.seq)
+
+_ILO_QUEUE: "queue.PriorityQueue[_CmdItem]" = queue.PriorityQueue()
+_ILO_SEQ = 0
+
+def _ilo_worker():
+    while True:
+        item: _CmdItem = _ILO_QUEUE.get()
+        try:
+            # Cross-process lock to serialize against daemon
+            lock_fd = None
+            try:
+                os.makedirs(os.path.dirname(_ILO_LOCK_FILE), exist_ok=True)
+                lock_fd = os.open(_ILO_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o666)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except Exception:
+                lock_fd = None
+            try:
+                out = _ilo_run_now(item.cmd, timeout=item.timeout)
+                item.out = out
+            except Exception as e:
+                item.err = e
+            finally:
+                if lock_fd is not None:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                        os.close(lock_fd)
+                    except Exception:
+                        pass
+        finally:
+            item.event.set()
+            _ILO_QUEUE.task_done()
+
+threading.Thread(target=_ilo_worker, daemon=True).start()
+
 
 def _load_ui_config():
     try:
@@ -241,7 +294,7 @@ def _apply_ui_overrides(cfg: Optional[dict] = None):
 _apply_ui_overrides()
 
 
-def _ilo_run(cmd: str, timeout: Optional[int] = None) -> str:
+def _ilo_run_now(cmd: str, timeout: Optional[int] = None) -> str:
     if timeout is None:
         timeout = ILO_SSH_TIMEOUT
     base = _build_ssh_base()
@@ -259,12 +312,26 @@ def _ilo_run(cmd: str, timeout: Optional[int] = None) -> str:
     _ILO_RECENT.append({"ts": time.time(), "cmd": cmd, "rc": 0, "ms": int((time.time()-t0)*1000), "out": (out + (res.stderr or ""))[-2000:]})
     return out
 
+def _ilo_run(cmd: str, timeout: Optional[int] = None, priority: int = 5) -> str:
+    # Enqueue the command for serialized execution within this process
+    if timeout is None:
+        timeout = ILO_SSH_TIMEOUT
+    global _ILO_SEQ
+    _ILO_SEQ += 1
+    item = _CmdItem(priority, _ILO_SEQ, cmd, timeout)
+    _ILO_QUEUE.put(item)
+    # Block until completion or timeout (worker handles subprocess timeout internally)
+    item.event.wait(timeout + 5)
+    if item.err:
+        raise item.err
+    return item.out or ""
 
-def _ilo_try(cmd: str, attempts: int = 2, timeout: Optional[int] = None) -> str:
+
+def _ilo_try(cmd: str, attempts: int = 2, timeout: Optional[int] = None, priority: int = 5) -> str:
     last_err: Optional[Exception] = None
     for i in range(max(1, attempts)):
         try:
-            return _ilo_run(cmd, timeout=timeout)
+            return _ilo_run(cmd, timeout=timeout, priority=priority)
         except Exception as e:
             last_err = e
             # Short backoff before retrying
@@ -283,7 +350,7 @@ def _discover_fans() -> List[str]:
         found: List[str] = []
         # Prefer concise 'fans show' listing if available
         try:
-            out = _ilo_run("fans show")
+            out = _ilo_run("fans show", priority=8)
             toks = re.findall(r"\bfan\d+\b", out.lower())
             if toks:
                 _DISCOVERED_FANS = sorted(set(toks), key=lambda x: int(re.findall(r"\d+", x)[0]))
@@ -292,7 +359,7 @@ def _discover_fans() -> List[str]:
             pass
         for p in FAN_PATHS:
             try:
-                out = _ilo_run(f"show {p}")
+                out = _ilo_run(f"show {p}", priority=8)
             except Exception:
                 continue
             # Find tokens like fan1 fan2
@@ -318,7 +385,7 @@ def _detect_fan_prop() -> Tuple[Optional[str], Optional[str]]:
         # Prefer explicit /system1/fanX read
         for cmd in (f"show /system1/{sample}", f"show -a /system1/{sample}"):
             try:
-                out = _ilo_run(cmd)
+                out = _ilo_run(cmd, priority=8)
                 for line in out.splitlines():
                     if '=' in line or ':' in line:
                         parts = re.split(r"[:=]", line, maxsplit=1)
@@ -334,7 +401,7 @@ def _detect_fan_prop() -> Tuple[Optional[str], Optional[str]]:
         mnum = re.search(r"(\d+)", sample)
         if mnum:
             try:
-                out = _ilo_run(f"fans {mnum.group(1)} show")
+                out = _ilo_run(f"fans {mnum.group(1)} show", priority=8)
                 for line in out.splitlines():
                     if '=' in line or ':' in line:
                         parts = re.split(r"[:=]", line, maxsplit=1)
@@ -350,7 +417,7 @@ def _detect_fan_prop() -> Tuple[Optional[str], Optional[str]]:
             for prefix in FAN_PATHS:
                 try:
                     # Attempt a no-op show to ensure path exists
-                    _ilo_run(f"show {prefix}/{sample}")
+                    _ilo_run(f"show {prefix}/{sample}", priority=8)
                     _DETECTED_PROP, _DETECTED_PATH = ILO_FAN_PROP, prefix
                     return _DETECTED_PROP, _DETECTED_PATH
                 except Exception:
@@ -358,10 +425,10 @@ def _detect_fan_prop() -> Tuple[Optional[str], Optional[str]]:
         # Otherwise attempt to read attributes and infer
         for prefix in FAN_PATHS:
             try:
-                out = _ilo_run(f"show -a {prefix}/{sample}")
+                out = _ilo_run(f"show -a {prefix}/{sample}", priority=8)
             except Exception:
                 try:
-                    out = _ilo_run(f"show {prefix}/{sample}")
+                    out = _ilo_run(f"show {prefix}/{sample}", priority=8)
                 except Exception:
                     continue
             # Look for key=value with candidate names and plausible 0..100 values
@@ -382,12 +449,12 @@ def _detect_fan_prop() -> Tuple[Optional[str], Optional[str]]:
             for prop in PROP_CANDIDATES:
                 try:
                     # Try a harmless set to the same value if we can read one
-                    out = _ilo_run(f"show {prefix}/{sample}")
+                    out = _ilo_run(f"show {prefix}/{sample}", priority=8)
                     m = re.search(r"\b(\d{1,3})\b", out)
                     if not m:
                         continue
                     v = int(m.group(1))
-                    _ilo_run(f"set {prefix}/{sample} {prop}={v}")
+                    _ilo_run(f"set {prefix}/{sample} {prop}={v}", priority=1)
                     _DETECTED_PROP, _DETECTED_PATH = prop, prefix
                     return _DETECTED_PROP, _DETECTED_PATH
                 except Exception:
@@ -437,7 +504,7 @@ def ilo_set_speed_percent_normal(fan: str, percent: int) -> bool:
             if not prefix:
                 continue
             try:
-                _ilo_run(f"set {prefix}/{fan} {pr}={percent}")
+                _ilo_run(f"set {prefix}/{fan} {pr}={percent}", priority=1)
                 # Cache success
                 with _detect_lock:
                     _DETECTED_PROP, _DETECTED_PATH = pr, prefix
@@ -450,13 +517,13 @@ def ilo_set_speed_percent_normal(fan: str, percent: int) -> bool:
         num = m.group(1)
         for pr in candidates:
             try:
-                _ilo_run(f"fans {num} {pr}={percent}")
+                _ilo_run(f"fans {num} {pr}={percent}", priority=1)
                 with _detect_lock:
                     _DETECTED_PROP, _DETECTED_PATH = pr, "fans"
                 return True
             except Exception:
                 try:
-                    _ilo_run(f"fans {num} set {pr} {percent}")
+                    _ilo_run(f"fans {num} set {pr} {percent}", priority=1)
                     with _detect_lock:
                         _DETECTED_PROP, _DETECTED_PATH = pr, "fans"
                     return True
@@ -472,13 +539,13 @@ def ilo_set_speed_percent_modded(pid: int, percent: int) -> bool:
     vmin = max(1, v255 - 4)  # min 4 steps below max
     ok = True
     try:
-        _ilo_run(f"fan p {pid} max {v255}")
+        _ilo_run(f"fan p {pid} max {v255}", priority=1)
     except Exception:
         ok = False
     try:
         # fixed 1s pacing between max/min
         time.sleep(max(1.0, ILO_CMD_GAP_MS/1000.0))
-        _ilo_run(f"fan p {pid} min {vmin}")
+        _ilo_run(f"fan p {pid} min {vmin}", priority=1)
     except Exception:
         ok = False
     return ok
@@ -505,7 +572,7 @@ def get_temps():
     if not cpu_temp:
         try:
             # iLO CPU temp is typically under /system1/sensor2, parse CurrentReading
-            out = _ilo_run("show /system1/sensor2")
+            out = _ilo_run("show /system1/sensor2", priority=9)
             m = re.search(r"CurrentReading\s*=\s*(\d{1,3})", out, re.IGNORECASE)
             cpu_temp = m.group(1) if m else ""
         except Exception:
@@ -557,6 +624,7 @@ def index():
         "ILO_CMD_GAP_MS": ILO_CMD_GAP_MS,
         "ILO_BATCH_SIZE": ILO_BATCH_SIZE,
         "PWM_UNITS": PWM_UNITS,
+        "configured_fans": FAN_IDS,
     }
     return render_template(
         "index.html",
@@ -589,7 +657,7 @@ def status():
                     break
         else:
             try:
-                stext = _ilo_run("show /system1/sensor2")
+                stext = _ilo_run("show /system1/sensor2", priority=9)
                 m = re.search(r"CurrentReading\s*=\s*(\d{1,3})", stext, re.IGNORECASE)
                 if m:
                     sensors.append({"label": "CPU (sensor2)", "value": m.group(1)})
@@ -663,7 +731,9 @@ def status():
     try:
         now = time.time()
         if now - _ILO_ACTUALS.get("ts", 0) > 10:
-            actuals_map: dict = {}
+            # Start with previous map so values persist if iLO is temporarily unreachable
+            prev_map = dict(_ILO_ACTUALS.get("map", {}))
+            actuals_map: dict = dict(prev_map)
             # Query discovered fans; fall back to configured FAN_IDS
             try:
                 fans = _discover_fans()
@@ -671,10 +741,14 @@ def status():
                     fans = FAN_IDS
             except Exception:
                 fans = FAN_IDS
-            for fan in fans:
+            for idx, fan in enumerate(fans):
                 try:
-                    out = _ilo_run(f"show /system1/{fan}", timeout=5)
+                    if idx > 0:
+                        # 5-second separation between show commands
+                        time.sleep(5)
+                    out = _ilo_run(f"show /system1/{fan}", timeout=5, priority=9)
                 except Exception:
+                    # Keep previous value if present
                     continue
                 # Look for a percent-like property among known candidates
                 val = None
@@ -708,10 +782,30 @@ def status():
     except Exception:
         fan_bits = []
 
+    # Queue depth and last command summary for UI indicators
+    try:
+        qdepth = _ILO_QUEUE.qsize()
+    except Exception:
+        qdepth = 0
+    try:
+        last_item = _ILO_RECENT[-1] if len(_ILO_RECENT) > 0 else None
+        if last_item:
+            last_obj = {
+                "cmd": last_item.get("cmd", ""),
+                "rc": last_item.get("rc", None),
+                "ms": last_item.get("ms", None),
+                "time": time.strftime("%H:%M:%S", time.localtime(last_item.get("ts", time.time())))
+            }
+        else:
+            last_obj = None
+    except Exception:
+        last_obj = None
+
     return jsonify({
         "cpu": cpu, "gpu": gpu, "gpu_name": gpu_name, "gpu_power": gpu_power,
     "fans": get_fan_speeds(), "fan_bits": fan_bits, "fans_ids": FAN_IDS,
         "ilo_fan_percents": ilo_map, "ilo_actuals_age": int(time.time() - _ILO_ACTUALS.get("ts", 0)),
+        "ilo_queue_depth": qdepth, "ilo_last_cmd": last_obj,
         "sensors": sensors, "gpu_info": gpu_info,
         "service": svc, "ok": True,
     })
@@ -839,7 +933,7 @@ def _run_quick_test(percent: int, duration: int):
             # Send separate commands per PID with small pacing gap (matches working pattern)
             for pid in pids:
                 try:
-                    _ilo_run(f"fan p {pid} max {v255}", timeout=8)
+                    _ilo_run(f"fan p {pid} max {v255}", timeout=8, priority=1)
                 except Exception:
                     pass
                 try:
@@ -961,6 +1055,32 @@ def update_settings():
     except Exception:
         pass
     _apply_ui_overrides(cfg)
+    # Optional per-fan mapping overrides: MAP_fan2=1 etc.
+    try:
+        global _EXPLICIT_PIDS, _COMPUTED_PIDS
+        fans = _discover_fans()
+        if not fans:
+            fans = FAN_IDS
+        mapping: List[int] = []
+        for f in fans:
+            v = request.form.get(f"MAP_{f}")
+            if v is not None and str(v).strip() != "":
+                try:
+                    mapping.append(int(v))
+                except Exception:
+                    pass
+        if mapping:
+            # Persist both to in-memory and config
+            cfg["FAN_P_IDS_STR"] = " ".join(str(x) for x in mapping)
+            try:
+                with open(UI_CONFIG_FILE, "w") as f:
+                    json.dump(cfg, f)
+            except Exception:
+                pass
+            _EXPLICIT_PIDS = mapping
+            _COMPUTED_PIDS = None  # force recompute
+    except Exception:
+        pass
     return redirect("/")
 
 

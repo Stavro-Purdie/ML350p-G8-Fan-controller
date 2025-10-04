@@ -24,6 +24,8 @@
 
   <div id="health" style="padding:8px; background:#eef; border:1px solid #ccd; margin:10px 0; display:none;"></div>
 
+  <div id="queueInfo" style="padding:8px; background:#efe; border:1px solid #cfc; margin:10px 0; display:none;"></div>
+
   <h2>Fan Curve</h2>
   <form method="post" action="/update_curve">
     <label>Min Temp: <input type="number" name="minTemp" value="{{ fan_curve.minTemp }}"> °C</label>
@@ -110,6 +112,20 @@
     <label>Explicit P-IDs (space-separated)
       <input type="text" name="FAN_P_IDS_STR" value="{{ settings.FAN_P_IDS_STR }}">
     </label>
+    <fieldset style="grid-column: 1 / -1; border:1px solid #ddd; padding:8px;">
+      <legend>Map Fans to P-IDs</legend>
+      <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:8px;">
+        {% for f in settings.get('configured_fans', []) or [] %}
+          <label>{{ f }} → PID
+            <input type="number" name="MAP_{{ f }}" min="0" max="10" placeholder="1">
+          </label>
+        {% endfor %}
+        {% if not settings.get('configured_fans') %}
+          <small>Fans not discovered yet; enter P-IDs above in "Explicit P-IDs" or save and refresh.</small>
+        {% endif %}
+      </div>
+      <small>Enter numbers (e.g., 1 for fan2). Leave empty to keep current mapping.</small>
+    </fieldset>
     <label>Property (normal mode)
       <input type="text" name="ILO_FAN_PROP" value="{{ settings.ILO_FAN_PROP }}" placeholder="speed|pwm|duty">
     </label>

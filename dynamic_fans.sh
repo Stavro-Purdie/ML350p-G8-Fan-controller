@@ -18,7 +18,7 @@ ILO_MODDED="1"
 ILO_PID_OFFSET="${ILO_PID_OFFSET:--1}"
 ILO_SSH_TTY="${ILO_SSH_TTY:-1}"
 VERBOSE="${VERBOSE:-0}"
-ILO_SSH_TIMEOUT="${ILO_SSH_TIMEOUT:-12}"
+ILO_SSH_TIMEOUT="${ILO_SSH_TIMEOUT:-320}"
 ILO_SSH_PERSIST="${ILO_SSH_PERSIST:-60}"
 # Default pacing gap between iLO commands (ms) — fixed to 1 second per request
 ILO_CMD_GAP_MS="${ILO_CMD_GAP_MS:-1000}"
@@ -145,15 +145,33 @@ ssh_ilo() {
   local cmd=$1
   [[ "$VERBOSE" == "1" ]] && echo "[ssh_ilo] CMD: $cmd" >&2
   local output rc
+  # Cross-process lock to avoid concurrent iLO commands
+  local LOCK_FILE="${LOCK_FILE:-/opt/dynamic-fan-ui/ilo.lock}"
+  local have_flock=0
+  command -v flock >/dev/null 2>&1 && have_flock=1
   if [[ -n "$ILO_PASSWORD" ]]; then
     if command -v sshpass >/dev/null 2>&1; then
-      output=$(sshpass -p "$ILO_PASSWORD" ssh "${SSH_OPTS[@]}" "$ILO_USER@$ILO_IP" "$cmd" 2>&1); rc=$?
+      if (( have_flock )); then
+        exec {FD}>"$LOCK_FILE"
+        flock -w "$ILO_SSH_TIMEOUT" "$FD"
+        output=$(sshpass -p "$ILO_PASSWORD" ssh "${SSH_OPTS[@]}" "$ILO_USER@$ILO_IP" "$cmd" 2>&1); rc=$?
+        flock -u "$FD"; exec {FD}>&-
+      else
+        output=$(sshpass -p "$ILO_PASSWORD" ssh "${SSH_OPTS[@]}" "$ILO_USER@$ILO_IP" "$cmd" 2>&1); rc=$?
+      fi
     else
       echo "sshpass not found but ILO_PASSWORD is set; install sshpass or use key-based auth" >&2
       return 1
     fi
   else
-    output=$(ssh -o BatchMode=yes "${SSH_OPTS[@]}" "$ILO_USER@$ILO_IP" "$cmd" 2>&1); rc=$?
+    if (( have_flock )); then
+      exec {FD}>"$LOCK_FILE"
+      flock -w "$ILO_SSH_TIMEOUT" "$FD"
+      output=$(ssh -o BatchMode=yes "${SSH_OPTS[@]}" "$ILO_USER@$ILO_IP" "$cmd" 2>&1); rc=$?
+      flock -u "$FD"; exec {FD}>&-
+    else
+      output=$(ssh -o BatchMode=yes "${SSH_OPTS[@]}" "$ILO_USER@$ILO_IP" "$cmd" 2>&1); rc=$?
+    fi
   fi
   [[ "$VERBOSE" == "1" ]] && echo "[ssh_ilo] OUT: ${output//$'\n'/ } (rc=$rc)" >&2
   printf "%s" "$output"
@@ -196,6 +214,8 @@ EOF
 fi
 
 # Function to read temps
+LAST_CPU_TS=0
+LAST_CPU_VAL=0
 get_cpu_temp() {
   if [[ "$USE_IPMI_TEMPS" == "1" && -n "$ILO_IP" && -n "$ILO_USER" ]]; then
     if command -v ipmitool >/dev/null 2>&1; then
@@ -208,10 +228,22 @@ get_cpu_temp() {
     fi
   fi
   # Fallback to iLO sensor2 over SSH (CPU temp)
-  ssh_ilo "show /system1/sensor2" \
+  local now_ts; now_ts=$(date +%s)
+  if (( LAST_CPU_TS > 0 && now_ts - LAST_CPU_TS < 20 && LAST_CPU_VAL > 0 )); then
+    echo "$LAST_CPU_VAL"; return
+  fi
+  local val
+  val=$(ssh_ilo "show /system1/sensor2" \
     | grep -i "^\s*CurrentReading=" \
     | sed -n -E 's/.*CurrentReading=([0-9]{1,3}).*/\1/p' \
-    | head -1
+    | head -1)
+  if [[ "$val" =~ ^[0-9]+$ ]]; then
+    LAST_CPU_VAL=$val
+    LAST_CPU_TS=$now_ts
+    echo "$val"
+  else
+    echo "$LAST_CPU_VAL"
+  fi
 }
 
 get_gpu_temp() {

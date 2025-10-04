@@ -125,6 +125,20 @@ function poll() {
           localStorage.setItem('dfc_history', JSON.stringify(payload));
         } catch (_) {}
       }
+
+      // Queue depth + last command indicators
+      const qdiv = document.getElementById('queueInfo');
+      if (qdiv) {
+        const depth = data.ilo_queue_depth ?? 0;
+        const last = data.ilo_last_cmd || null;
+        if (depth || last) {
+          qdiv.style.display = 'block';
+          const lastText = last ? ` • last [${last.time}] rc=${last.rc ?? ''} ${last.ms ?? ''}ms :: ${last.cmd || ''}` : '';
+          qdiv.textContent = `iLO queue depth: ${depth}${lastText}`;
+        } else {
+          qdiv.style.display = 'none';
+        }
+      }
     })
     .catch(() => {});
 }
