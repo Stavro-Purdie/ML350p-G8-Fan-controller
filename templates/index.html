@@ -32,25 +32,28 @@
   Max Speed: <input type="number" name="maxSpeed" value="{{ fan_curve.maxSpeed }}"> %<br>
   <hr>
   <strong>GPU Curve (optional)</strong><br>
-  Min Temp: <input type="number" name="gpu_minTemp" value="{{ fan_curve.gpu.minTemp if fan_curve.gpu is defined else '' }}"> °C<br>
-  Max Temp: <input type="number" name="gpu_maxTemp" value="{{ fan_curve.gpu.maxTemp if fan_curve.gpu is defined else '' }}"> °C<br>
-  Min Speed: <input type="number" name="gpu_minSpeed" value="{{ fan_curve.gpu.minSpeed if fan_curve.gpu is defined else '' }}"> %<br>
-  Max Speed: <input type="number" name="gpu_maxSpeed" value="{{ fan_curve.gpu.maxSpeed if fan_curve.gpu is defined else '' }}"> %<br>
+  {% set gpu_curve = fan_curve.get('gpu', {}) %}
+  Min Temp: <input type="number" name="gpu_minTemp" value="{{ gpu_curve.get('minTemp', '') }}"> °C<br>
+  Max Temp: <input type="number" name="gpu_maxTemp" value="{{ gpu_curve.get('maxTemp', '') }}"> °C<br>
+  Min Speed: <input type="number" name="gpu_minSpeed" value="{{ gpu_curve.get('minSpeed', '') }}"> %<br>
+  Max Speed: <input type="number" name="gpu_maxSpeed" value="{{ gpu_curve.get('maxSpeed', '') }}"> %<br>
   <hr>
   <strong>Blending</strong><br>
   Mode:
-  {% set blend_mode = fan_curve.blend.mode if fan_curve.blend is defined and fan_curve.blend.mode is defined else 'max' %}
+  {% set blend = fan_curve.get('blend', {}) %}
+  {% set blend_mode = blend.get('mode', 'max') %}
   <select name="blend_mode">
     <option value="max" {{ 'selected' if blend_mode == 'max' else '' }}>Max(CPU, GPU)</option>
     <option value="weighted" {{ 'selected' if blend_mode == 'weighted' else '' }}>Weighted</option>
   </select><br>
-  {% set cpu_w = fan_curve.blend.cpuWeight if fan_curve.blend is defined and fan_curve.blend.cpuWeight is defined else 0.5 %}
-  {% set gpu_w = fan_curve.blend.gpuWeight if fan_curve.blend is defined and fan_curve.blend.gpuWeight is defined else 0.5 %}
+  {% set cpu_w = blend.get('cpuWeight', 0.5) %}
+  {% set gpu_w = blend.get('gpuWeight', 0.5) %}
   CPU Weight: <input type="number" step="0.1" name="blend_cpuWeight" value="{{ cpu_w }}"> 
   GPU Weight: <input type="number" step="0.1" name="blend_gpuWeight" value="{{ gpu_w }}"><br>
   <strong>GPU Boost (optional)</strong><br>
-  {% set gb_t = fan_curve.gpuBoost.threshold if fan_curve.gpuBoost is defined and fan_curve.gpuBoost.threshold is defined else '' %}
-  {% set gb_a = fan_curve.gpuBoost.add if fan_curve.gpuBoost is defined and fan_curve.gpuBoost.add is defined else 0 %}
+  {% set gb = fan_curve.get('gpuBoost', {}) %}
+  {% set gb_t = gb.get('threshold', '') %}
+  {% set gb_a = gb.get('add', 0) %}
   Threshold (°C): <input type="number" name="gpuBoost_threshold" value="{{ gb_t }}"> 
   Add (%) : <input type="number" name="gpuBoost_add" value="{{ gb_a }}"><br>
   <button type="submit">Update Curve</button>
