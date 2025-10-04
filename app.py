@@ -3,21 +3,51 @@ import json, os
 
 app = Flask(__name__)
 
-FAN_CURVE_FILE = os.getenv("FAN_CURVE_FILE", "fan_curve.json")
-FAN_SPEED_FILE = os.getenv("FAN_SPEED_FILE", "fan_speeds.txt")
+# Default to server install paths; can be overridden by env
+FAN_CURVE_FILE = os.getenv("FAN_CURVE_FILE", "/opt/dynamic-fan-ui/fan_curve.json")
+FAN_SPEED_FILE = os.getenv("FAN_SPEED_FILE", "/opt/dynamic-fan-ui/fan_speeds.txt")
 FAN_IDS = ["fan1", "fan2", "fan3", "fan4", "fan5"]
 
 
 def load_curve():
-    data = {"minTemp": 30, "maxTemp": 80, "minSpeed": 20, "maxSpeed": 100}
+    # Base defaults
+    data = {
+        "minTemp": 30,
+        "maxTemp": 80,
+        "minSpeed": 20,
+        "maxSpeed": 100,
+        # Provide optional sections with safe defaults to satisfy older templates
+        "blend": {"mode": "max", "cpuWeight": 0.5, "gpuWeight": 0.5},
+        "gpu": {"minTemp": "", "maxTemp": "", "minSpeed": "", "maxSpeed": ""},
+        "gpuBoost": {"threshold": "", "add": 0},
+    }
     try:
         if os.path.exists(FAN_CURVE_FILE):
             with open(FAN_CURVE_FILE) as f:
                 obj = json.load(f)
                 if isinstance(obj, dict):
-                    data.update(obj)
+                    # Merge loaded values over defaults
+                    for k, v in obj.items():
+                        data[k] = v
     except Exception:
         pass
+    # Ensure optional sections remain dicts with required keys
+    if not isinstance(data.get("blend"), dict):
+        data["blend"] = {"mode": "max", "cpuWeight": 0.5, "gpuWeight": 0.5}
+    else:
+        data["blend"].setdefault("mode", "max")
+        data["blend"].setdefault("cpuWeight", 0.5)
+        data["blend"].setdefault("gpuWeight", 0.5)
+    if not isinstance(data.get("gpu"), dict):
+        data["gpu"] = {"minTemp": "", "maxTemp": "", "minSpeed": "", "maxSpeed": ""}
+    else:
+        for k in ("minTemp", "maxTemp", "minSpeed", "maxSpeed"):
+            data["gpu"].setdefault(k, "")
+    if not isinstance(data.get("gpuBoost"), dict):
+        data["gpuBoost"] = {"threshold": "", "add": 0}
+    else:
+        data["gpuBoost"].setdefault("threshold", "")
+        data["gpuBoost"].setdefault("add", 0)
     return data
 
 
