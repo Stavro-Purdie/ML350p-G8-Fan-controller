@@ -431,6 +431,8 @@ def index():
         "ILO_PID_OFFSET": ILO_PID_OFFSET,
         "FAN_P_IDS_STR": " ".join(str(x) for x in _EXPLICIT_PIDS) if _EXPLICIT_PIDS else "",
         "ILO_FAN_PROP": ILO_FAN_PROP or "",
+        "ILO_CMD_GAP_MS": ILO_CMD_GAP_MS,
+        "ILO_BATCH_SIZE": ILO_BATCH_SIZE,
     }
     return render_template(
         "index.html",
@@ -763,7 +765,8 @@ def update_settings():
     cfg = _load_ui_config()
     fields = [
         "ILO_SSH_LEGACY", "ILO_SSH_TTY", "ILO_SSH_TIMEOUT", "ILO_SSH_PERSIST",
-        "ILO_MODDED", "ILO_PID_OFFSET", "FAN_P_IDS_STR", "ILO_FAN_PROP"
+        "ILO_MODDED", "ILO_PID_OFFSET", "FAN_P_IDS_STR", "ILO_FAN_PROP",
+        "ILO_CMD_GAP_MS", "ILO_BATCH_SIZE"
     ]
     for k in fields:
         v = request.form.get(k)

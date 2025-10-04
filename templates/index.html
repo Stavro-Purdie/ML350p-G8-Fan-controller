@@ -87,6 +87,49 @@
     • <a href="/debug_ilo_fans" target="_blank">Debug iLO Fans</a>
   </p>
 
+  <h2>iLO Control Settings</h2>
+  <form method="post" action="/settings" style="display:grid; grid-template-columns: repeat(3, minmax(200px, 1fr)); gap:8px; align-items:center;">
+    <label>Legacy SSH
+      <select name="ILO_SSH_LEGACY"><option value="0" {% if not settings.ILO_SSH_LEGACY %}selected{% endif %}>No</option><option value="1" {% if settings.ILO_SSH_LEGACY %}selected{% endif %}>Yes</option></select>
+    </label>
+    <label>Force TTY
+      <select name="ILO_SSH_TTY"><option value="0" {% if not settings.ILO_SSH_TTY %}selected{% endif %}>No</option><option value="1" {% if settings.ILO_SSH_TTY %}selected{% endif %}>Yes</option></select>
+    </label>
+    <label>SSH Timeout (s)
+      <input type="number" name="ILO_SSH_TIMEOUT" value="{{ settings.ILO_SSH_TIMEOUT }}">
+    </label>
+    <label>Persist (s)
+      <input type="number" name="ILO_SSH_PERSIST" value="{{ settings.ILO_SSH_PERSIST }}">
+    </label>
+    <label>Modded iLO
+      <select name="ILO_MODDED"><option value="0" {% if not settings.ILO_MODDED %}selected{% endif %}>No</option><option value="1" {% if settings.ILO_MODDED %}selected{% endif %}>Yes</option></select>
+    </label>
+    <label>PID Offset
+      <input type="number" name="ILO_PID_OFFSET" value="{{ settings.ILO_PID_OFFSET }}">
+    </label>
+    <label>Explicit P-IDs (space-separated)
+      <input type="text" name="FAN_P_IDS_STR" value="{{ settings.FAN_P_IDS_STR }}">
+    </label>
+    <label>Property (normal mode)
+      <input type="text" name="ILO_FAN_PROP" value="{{ settings.ILO_FAN_PROP }}" placeholder="speed|pwm|duty">
+    </label>
+    <label>Cmd Gap (ms)
+      <input type="number" name="ILO_CMD_GAP_MS" value="{{ settings.ILO_CMD_GAP_MS or 75 }}">
+    </label>
+    <label>Batch Size
+      <input type="number" name="ILO_BATCH_SIZE" value="{{ settings.ILO_BATCH_SIZE or 1 }}">
+    </label>
+    <div style="grid-column: 1 / -1; margin-top:6px;"><button type="submit">Save Settings</button></div>
+  </form>
+
+  <h2>Recent iLO Commands (server)</h2>
+  <button onclick="loadILORecent()">Refresh</button>
+  <pre id="iloRecent" style="white-space:pre-wrap; background:#111; color:#0f0; padding:8px; max-height:240px; overflow:auto;"></pre>
+
+  <h2>Daemon Logs (last 80 lines)</h2>
+  <button onclick="loadLogs()">Refresh</button>
+  <pre id="logs" style="white-space:pre-wrap; background:#222; color:#ddd; padding:8px; max-height:300px; overflow:auto;"></pre>
+
   <h2>Other Sensors</h2>
   <table id="sensors" border="1" cellpadding="4" cellspacing="0">
     <thead><tr><th>Sensor</th><th>Value (°C)</th></tr></thead>

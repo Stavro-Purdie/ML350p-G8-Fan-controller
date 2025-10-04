@@ -151,3 +151,26 @@ window.addEventListener('load', () => {
   poll();
   setInterval(poll, 5000);
 });
+
+function loadILORecent() {
+  fetch('/ilo_recent').then(r => r.json()).then(arr => {
+    const pre = document.getElementById('iloRecent');
+    if (!pre) return;
+    const lines = (arr || []).map(x => {
+      try {
+        return `[${x.time}] rc=${x.rc} ${x.ms}ms :: ${x.cmd}\n${(x.out||'').trim()}`;
+      } catch (_) {
+        return JSON.stringify(x);
+      }
+    });
+    pre.textContent = lines.join('\n\n');
+  }).catch(() => {});
+}
+
+function loadLogs() {
+  fetch('/logs').then(r => r.json()).then(obj => {
+    const pre = document.getElementById('logs');
+    if (!pre) return;
+    if (obj.ok) pre.textContent = obj.text || ''; else pre.textContent = obj.error || 'Error fetching logs';
+  }).catch(() => {});
+}
