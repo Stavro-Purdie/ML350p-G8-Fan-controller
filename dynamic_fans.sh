@@ -44,8 +44,8 @@ FAN_PATHS=("/system1" "/system1/fans1")
 PROP_CANDIDATES=("speed" "pwm" "duty" "duty_cycle" "fan_speed" "percentage")
 # Allow override of fan property (non-modded)
 ILO_FAN_PROP="${ILO_FAN_PROP:-}"
-# Force controlling only three fans: fan1, fan2, fan3
-FAN_IDS=("fan1" "fan2" "fan3")
+# Force controlling only three fans (skip disconnected fan1): fan2, fan3, fan4
+FAN_IDS=("fan2" "fan3" "fan4")
 
 # Discover fans using 'fan info' (avoids 'show' calls)
 discover_from_fan_info() {
@@ -70,8 +70,11 @@ if [[ -n "${FAN_P_IDS_STR:-}" ]]; then
   read -r -a P_IDS <<<"$FAN_P_IDS_STR"
 fi
 # If not provided, attempt discovery first, then derive from FAN_IDS
-# Hard-code P-IDs for the three fans
-P_IDS=("1" "2" "3")
+# Default P-IDs for the three fans (respect override if provided)
+if (( ${#P_IDS[@]} == 0 )); then
+  # Mapping per user: fan2->p1, fan3->p2, fan4->p3
+  P_IDS=("1" "2" "3")
+fi
 
 # Note: We avoid 'show' and 'fans show' for discovery or detection to reduce iLO load.
 

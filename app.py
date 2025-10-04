@@ -9,7 +9,7 @@ app = Flask(__name__)
 FAN_CURVE_FILE = os.getenv("FAN_CURVE_FILE", "/opt/dynamic-fan-ui/fan_curve.json")
 FAN_SPEED_FILE = os.getenv("FAN_SPEED_FILE", "/opt/dynamic-fan-ui/fan_speeds.txt")
 UI_CONFIG_FILE = os.getenv("UI_CONFIG_FILE", "/opt/dynamic-fan-ui/ui_config.json")
-FAN_IDS = ["fan1", "fan2", "fan3"]
+FAN_IDS = ["fan2", "fan3", "fan4"]
 # Allow override via env string: FAN_IDS_STR="fan2 fan3 fan4"
 _ids_env = os.getenv("FAN_IDS_STR", "").strip()
 if _ids_env:
@@ -372,8 +372,13 @@ def _compute_pids(fans: List[str]) -> List[int]:
             if pid < 0:
                 pid = 0
             pids.append(pid)
-        # Clamp to first three P-IDs 1..3
-        _COMPUTED_PIDS = [1, 2, 3][:len(fans)]
+        # Mapping per user: fan2->p1, fan3->p2, fan4->p4
+        mapping = []
+        for f in fans:
+            if f == "fan2": mapping.append(1)
+            elif f == "fan3": mapping.append(2)
+            elif f == "fan4": mapping.append(4)
+        _COMPUTED_PIDS = mapping
         return _COMPUTED_PIDS
 
 
