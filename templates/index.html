@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Dynamic Fan Control</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/script.js"></script>
+</head>
+<body>
+<h1>HP ML350p Gen8 Fan Dashboard</h1>
+
+<div>
+  <p>CPU Temp: <span id="cpu">{{ cpu_temp }}</span> °C</p>
+  <p>GPU Temp: <span id="gpu">{{ gpu_temp }}</span> °C</p>
+</div>
+
+<h2>Fan Speeds</h2>
+<ul id="fan-speeds">
+{% for fan in fan_speeds %}
+  <li>{{ fan }}%</li>
+{% endfor %}
+</ul>
+
+<h2>Fan Curve</h2>
+<form method="post" action="/update_curve">
+  Min Temp: <input type="number" name="minTemp" value="{{ fan_curve.minTemp }}"> °C<br>
+  Max Temp: <input type="number" name="maxTemp" value="{{ fan_curve.maxTemp }}"> °C<br>
+  Min Speed: <input type="number" name="minSpeed" value="{{ fan_curve.minSpeed }}"> %<br>
+  Max Speed: <input type="number" name="maxSpeed" value="{{ fan_curve.maxSpeed }}"> %<br>
+  <button type="submit">Update Curve</button>
+</form>
+
+<h2>Service Control</h2>
+<form method="post" action="/control">
+  <button name="action" value="start">Start Fan Control</button>
+  <button name="action" value="stop">Stop Fan Control</button>
+</form>
+
+</body>
+</html>

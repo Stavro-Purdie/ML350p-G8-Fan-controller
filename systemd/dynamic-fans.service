@@ -1,0 +1,24 @@
+[Unit]
+Description=Dynamic Fan Control for HP ML350p Gen8
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dynamic_fans.sh
+Restart=always
+RestartSec=2
+# Environment overrides placed in /etc/systemd/system/dynamic-fans.service.d/override.conf
+Environment=FAN_CURVE_FILE=/opt/dynamic-fan-ui/fan_curve.json
+Environment=FAN_SPEED_FILE=/opt/dynamic-fan-ui/fan_speeds.txt
+Environment=CHECK_INTERVAL=5
+Environment=MAX_STEP=10
+# iLO auth defaults; override via override.conf for host-specific details
+Environment=ILO_IP=192.168.1.100
+Environment=ILO_USER=admin
+Environment=ILO_SSH_KEY=/root/.ssh/ilo_key
+# Optional password auth if sshpass available
+# Environment=ILO_PASSWORD=
+
+[Install]
+WantedBy=multi-user.target
