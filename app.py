@@ -1,8 +1,86 @@
-from flask import Flask, render_template, request, redirect, jsonify
+from flask import Flask, render_template, render_template_string, request, redirect, jsonify
 import subprocess, json, os, re, threading, time, shutil
 from typing import Any, Dict, List
 
 app = Flask(__name__)
+
+# Inline minimal template to avoid external template mismatches/caching
+INDEX_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset=\"utf-8\">
+    <title>Dynamic Fan Control</title>
+    <style>
+        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+        .meters { list-style: none; padding: 0; display: flex; gap: 8px; }
+        .meters li { background: #eee; border: 1px solid #ccc; padding: 6px 10px; border-radius: 4px; min-width: 40px; text-align: center; }
+        label { display:block; margin-top: 6px; }
+        input { width: 100px; }
+        .row { display:flex; gap:24px; flex-wrap:wrap; }
+        fieldset { border:1px solid #ddd; padding:10px; border-radius:6px; }
+        legend { font-weight:600; }
+        .actions { margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>HP ML350p Gen8 Fan Dashboard</h1>
+
+    <div>
+        <p>CPU Temp: <strong>{{ cpu_temp or '' }}</strong> °C</p>
+        <p>GPU Temp: <strong>{{ gpu_temp or '' }}</strong> °C</p>
+    </div>
+
+    <h2>Fan Speeds</h2>
+    <ul class=\"meters\">
+        {% for s in fan_speeds %}<li>{{ s }}%</li>{% endfor %}
+    </ul>
+
+    <h2>Fan Curve</h2>
+    <form method=\"post\" action=\"/update_curve\">
+        <div class=\"row\">
+            <fieldset>
+                <legend>CPU Curve</legend>
+                <label>Min Temp: <input type=\"number\" name=\"minTemp\" value=\"{{ fan_curve.minTemp }}\"> °C</label>
+                <label>Max Temp: <input type=\"number\" name=\"maxTemp\" value=\"{{ fan_curve.maxTemp }}\"> °C</label>
+                <label>Min Speed: <input type=\"number\" name=\"minSpeed\" value=\"{{ fan_curve.minSpeed }}\"> %</label>
+                <label>Max Speed: <input type=\"number\" name=\"maxSpeed\" value=\"{{ fan_curve.maxSpeed }}\"> %</label>
+            </fieldset>
+
+            <fieldset>
+                <legend>GPU Curve (optional)</legend>
+                <label>Min Temp: <input type=\"number\" name=\"gpu_minTemp\" value=\"{{ gpu_minTemp }}\"> °C</label>
+                <label>Max Temp: <input type=\"number\" name=\"gpu_maxTemp\" value=\"{{ gpu_maxTemp }}\"> °C</label>
+                <label>Min Speed: <input type=\"number\" name=\"gpu_minSpeed\" value=\"{{ gpu_minSpeed }}\"> %</label>
+                <label>Max Speed: <input type=\"number\" name=\"gpu_maxSpeed\" value=\"{{ gpu_maxSpeed }}\"> %</label>
+            </fieldset>
+
+            <fieldset>
+                <legend>Blending</legend>
+                <label>Mode:
+                    <select name=\"blend_mode\">
+                        <option value=\"max\" {{ 'selected' if blend_mode == 'max' else '' }}>Max(CPU, GPU)</option>
+                        <option value=\"weighted\" {{ 'selected' if blend_mode == 'weighted' else '' }}>Weighted</option>
+                    </select>
+                </label>
+                <label>CPU Weight: <input type=\"number\" step=\"0.1\" name=\"blend_cpuWeight\" value=\"{{ cpu_w }}\"></label>
+                <label>GPU Weight: <input type=\"number\" step=\"0.1\" name=\"blend_gpuWeight\" value=\"{{ gpu_w }}\"></label>
+            </fieldset>
+
+            <fieldset>
+                <legend>GPU Boost (optional)</legend>
+                <label>Threshold (°C): <input type=\"number\" name=\"gpuBoost_threshold\" value=\"{{ gb_t }}\"></label>
+                <label>Add (%): <input type=\"number\" name=\"gpuBoost_add\" value=\"{{ gb_a }}\"></label>
+            </fieldset>
+        </div>
+        <div class=\"actions\">
+            <button type=\"submit\">Update Curve</button>
+        </div>
+    </form>
+
+</body>
+</html>
+"""
 
 # Configurable via environment variables with sensible defaults
 FAN_SCRIPT = os.getenv("FAN_SCRIPT", "/usr/local/bin/dynamic_fans.sh")
@@ -306,8 +384,8 @@ def index():
     gb_t = gb.get("threshold", "")
     gb_a = gb.get("add", 0)
 
-    return render_template(
-        "index.html",
+    return render_template_string(
+        INDEX_TEMPLATE,
         cpu_temp=cpu_temp,
         gpu_temp=gpu_temp,
         fan_speeds=fan_speeds,
