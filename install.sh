@@ -30,6 +30,8 @@ USE_IPMI_TEMPS=${USE_IPMI_TEMPS:-0}
 INSTALL_SYSTEMD=${INSTALL_SYSTEMD:-yes}
 ILO_SSH_LEGACY=${ILO_SSH_LEGACY:-0}
 START_NOW=${START_NOW:-yes}
+FAN_IDS_STR=${FAN_IDS_STR:-}
+RUN_RAMP_TEST=${RUN_RAMP_TEST:-yes}
 
 echo "\n=== ML350p-G8-Fan-controller Installer ==="
 prompt "iLO IP" "$ILO_IP" ILO_IP
@@ -49,12 +51,21 @@ if [[ "$use_ipmi" =~ ^[Yy]$ ]]; then USE_IPMI_TEMPS=1; else USE_IPMI_TEMPS=0; fi
 read -r -p "Enable legacy SSH algorithms for older iLO (fixes KEX error)? (y/n) [y]: " legacy
 legacy=${legacy:-y}
 if [[ "$legacy" =~ ^[Yy]$ ]]; then ILO_SSH_LEGACY=1; else ILO_SSH_LEGACY=0; fi
+read -r -p "Which fan indices are installed? e.g., '2 3 4' (leave blank for default all): " fan_idxs
+fan_idxs=${fan_idxs:-}
+if [[ -n "$fan_idxs" ]]; then
+  # Build space-separated list like: fan2 fan3 fan4
+  FAN_IDS_STR=$(printf "%s\n" $fan_idxs | awk '{for(i=1;i<=NF;i++) printf "fan%s%s", $i, (i<NF?" ":"\n") }')
+fi
 read -r -p "Install and enable systemd service? (y/n) [y]: " sysd
 sysd=${sysd:-y}
 if [[ "$sysd" =~ ^[Yy]$ ]]; then INSTALL_SYSTEMD=yes; else INSTALL_SYSTEMD=no; fi
 read -r -p "Start services now after install? (y/n) [y]: " start_now
 start_now=${start_now:-y}
 if [[ "$start_now" =~ ^[Yy]$ ]]; then START_NOW=yes; else START_NOW=no; fi
+read -r -p "Run a brief fan ramp test now (100% for 10s)? (y/n) [y]: " ramp
+ramp=${ramp:-y}
+if [[ "$ramp" =~ ^[Yy]$ ]]; then RUN_RAMP_TEST=yes; else RUN_RAMP_TEST=no; fi
 
 create_dirs() {
   echo "Creating directories..."
@@ -137,6 +148,7 @@ Environment=CHECK_INTERVAL=5
 Environment=MAX_STEP=10
 Environment=USE_IPMI_TEMPS=$USE_IPMI_TEMPS
 Environment=ILO_SSH_LEGACY=$ILO_SSH_LEGACY
+Environment=FAN_IDS_STR=$FAN_IDS_STR
 EOF
 
   # UI overrides
@@ -151,6 +163,7 @@ Environment=ILO_SSH_KEY=$ILO_SSH_KEY
 Environment=ILO_PASSWORD=$ILO_PASSWORD
 Environment=USE_IPMI_TEMPS=$USE_IPMI_TEMPS
 Environment=ILO_SSH_LEGACY=$ILO_SSH_LEGACY
+Environment=FAN_IDS_STR=$FAN_IDS_STR
 WorkingDirectory=$APP_DIR/app
 EOF
 
@@ -252,7 +265,8 @@ connectivity_check() {
   out=$("${cmd[@]}" 2>/dev/null)
   rc=$?
   set -e
-  if [[ $rc -ne 0 || "$out" != "ok" ]]; then
+  # Treat success if command exit was 0 or output contains 'ok' (iLO may print disclaimer text)
+  if [[ $rc -ne 0 || ! "$out" =~ [Oo][Kk] ]]; then
     echo "Modern SSH failed; retrying with legacy algorithms..."
     ssh_base+=(
       -o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1 \
@@ -270,7 +284,7 @@ connectivity_check() {
     out=$("${cmd[@]}" 2>/dev/null)
     rc=$?
     set -e
-    if [[ $rc -eq 0 && "$out" == "ok" ]]; then
+    if [[ $rc -eq 0 || "$out" =~ [Oo][Kk] ]]; then
       echo "Legacy SSH works. Enabling ILO_SSH_LEGACY=1."
       ILO_SSH_LEGACY=1
     else
@@ -279,6 +293,45 @@ connectivity_check() {
   else
     echo "iLO SSH connectivity OK."
   fi
+}
+
+fan_ramp_test() {
+  if [[ "$RUN_RAMP_TEST" != "yes" ]]; then return 0; fi
+  echo "Running fan ramp test (100% for 10s)..."
+  local ssh_base=(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o ConnectionAttempts=1)
+  if [[ -n "$ILO_SSH_KEY" && -f "$ILO_SSH_KEY" ]]; then
+    ssh_base+=( -i "$ILO_SSH_KEY" )
+  fi
+  if [[ "$ILO_SSH_LEGACY" == "1" ]]; then
+    ssh_base+=(
+      -o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1 \
+      -o HostKeyAlgorithms=+ssh-rsa \
+      -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+      -o PubkeyAcceptedKeyTypes=+ssh-rsa \
+      -o Ciphers=+aes128-cbc,3des-cbc \
+      -o MACs=+hmac-sha1
+    )
+  fi
+  local base=("${ssh_base[@]}" "$ILO_USER@$ILO_IP")
+  if [[ -n "$ILO_PASSWORD" && $(command -v sshpass) ]]; then
+    base=(sshpass -p "$ILO_PASSWORD" "${ssh_base[@]}" "$ILO_USER@$ILO_IP")
+  fi
+  local fans
+  if [[ -n "$FAN_IDS_STR" ]]; then
+    fans=($FAN_IDS_STR)
+  else
+    fans=(fan1 fan2 fan3 fan4 fan5)
+  fi
+  for f in "${fans[@]}"; do
+    echo " - $f => 100%"
+    "${base[@]}" "set /system1/$f speed=100" >/dev/null 2>&1 || true
+  done
+  sleep 10
+  for f in "${fans[@]}"; do
+    echo " - $f => 30%"
+    "${base[@]}" "set /system1/$f speed=30" >/dev/null 2>&1 || true
+  done
+  echo "Fan ramp test complete."
 }
 
 start_services() {
@@ -295,6 +348,7 @@ main() {
   create_dirs
   install_prereqs
   connectivity_check
+  fan_ramp_test
   install_scripts
   install_ui
   if [[ "$INSTALL_SYSTEMD" == "yes" ]]; then

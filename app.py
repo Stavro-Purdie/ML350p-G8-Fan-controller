@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, redirect, jsonify
-import subprocess, json, os, re
+import subprocess, json, os, re, threading, time, shutil
 from typing import Any, Dict, List
 
 app = Flask(__name__)
@@ -15,7 +15,11 @@ ILO_PASSWORD = os.getenv("ILO_PASSWORD", "")
 USE_IPMI_TEMPS = os.getenv("USE_IPMI_TEMPS", "0") == "1"
 ILO_SSH_LEGACY = os.getenv("ILO_SSH_LEGACY", "0") == "1"
 
-FAN_IDS = os.getenv("FAN_IDS", "fan1,fan2,fan3,fan4,fan5").split(",")
+FAN_IDS_ENV = os.getenv("FAN_IDS_STR", "").strip()
+if FAN_IDS_ENV:
+    FAN_IDS = FAN_IDS_ENV.split()
+else:
+    FAN_IDS = os.getenv("FAN_IDS", "fan1,fan2,fan3,fan4,fan5").split(",")
 
 def get_temps():
     # Allow optional key; if missing, rely on ssh config or password auth (external)
@@ -49,7 +53,9 @@ def get_temps():
             ssh_cmd = ["sshpass", "-p", ILO_PASSWORD] + ssh_cmd
         try:
             sensors = subprocess.check_output(ssh_cmd, text=True, timeout=2)
-            cpu_temp = subprocess.check_output("grep 'CPU' | awk '{print $2}' | sort -nr | head -1", input=sensors, shell=True, text=True).strip()
+            # Look for lines containing CPU/Proc/Processor and extract the highest integer
+            cmd = r"awk 'tolower($0) ~ /cpu|proc|processor/ { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) print $i }' | sort -nr | head -1"
+            cpu_temp = subprocess.check_output(cmd, input=sensors, shell=True, text=True).strip()
         except Exception:
             cpu_temp = ""
     try:
@@ -108,7 +114,8 @@ def test_ilo():
                 ipmi_ok = len(ipmi_out.strip()) > 0
             except Exception as e:
                 ipmi_error = str(e)
-        return jsonify({"ok": out == "ok", "method": method, "output": out, "ipmi": {"enabled": USE_IPMI_TEMPS, "ok": ipmi_ok, "error": ipmi_error}})
+        ok_flag = (out.lower().find("ok") != -1)
+        return jsonify({"ok": ok_flag, "method": method, "output": out, "ipmi": {"enabled": USE_IPMI_TEMPS, "ok": ipmi_ok, "error": ipmi_error}})
     except Exception as e:
         return jsonify({"ok": False, "method": method, "error": str(e), "ipmi": {"enabled": USE_IPMI_TEMPS}}), 500
 
@@ -117,6 +124,81 @@ def get_fan_speeds():
         with open(FAN_SPEED_FILE) as f:
             return [int(x.strip()) for x in f.readlines()]
     return [0]*len(FAN_IDS)
+
+# Build SSH base for iLO commands
+def build_ssh_base() -> list[str]:
+    base = ["ssh", "-o", "StrictHostKeyChecking=no"]
+    if ILO_SSH_LEGACY:
+        base += [
+            "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1",
+            "-o", "HostKeyAlgorithms=+ssh-rsa",
+            "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+            "-o", "PubkeyAcceptedKeyTypes=+ssh-rsa",
+            "-o", "Ciphers=+aes128-cbc,3des-cbc",
+            "-o", "MACs=+hmac-sha1",
+        ]
+    if ILO_SSH_KEY and os.path.exists(ILO_SSH_KEY):
+        base += ["-i", ILO_SSH_KEY]
+    return base
+
+_test_lock = threading.Lock()
+_test_running = False
+
+def _run_fan_test(percent: int, duration: int):
+    global _test_running
+    with _test_lock:
+        if _test_running:
+            return
+        _test_running = True
+    try:
+        # Determine if control loop is active
+        was_active = False
+        if shutil.which("systemctl") is not None:
+            try:
+                out = subprocess.check_output(["systemctl", "is-active", "dynamic-fans.service"], text=True, timeout=2).strip()
+                was_active = (out == "active")
+            except Exception:
+                was_active = False
+        if was_active:
+            subprocess.Popen(["systemctl", "stop", "dynamic-fans.service"])  # stop asynchronously
+            time.sleep(1)
+
+        base = build_ssh_base()
+        ssh_cmd = base + [f"{ILO_USER}@{ILO_IP}"]
+        if ILO_PASSWORD:
+            ssh_cmd = ["sshpass", "-p", ILO_PASSWORD] + ssh_cmd
+        # Apply test speed
+        for fan in FAN_IDS:
+            try:
+                subprocess.run(ssh_cmd + [f"set /system1/{fan} speed={percent}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            except Exception:
+                pass
+        time.sleep(duration)
+        # Drop to a safe level before resuming control
+        for fan in FAN_IDS:
+            try:
+                subprocess.run(ssh_cmd + ["set", f"/system1/{fan}", "speed=30"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            except Exception:
+                pass
+        if was_active:
+            subprocess.Popen(["systemctl", "start", "dynamic-fans.service"])  # resume
+    finally:
+        with _test_lock:
+            _test_running = False
+
+@app.route("/fan_test", methods=["POST"])
+def fan_test():
+    # Run a brief ramp in background, then redirect immediately
+    try:
+        percent = int(request.form.get("test_percent", "100"))
+        duration = int(request.form.get("test_duration", "10"))
+    except Exception:
+        percent, duration = 100, 10
+    percent = max(0, min(100, percent))
+    duration = max(1, min(60, duration))
+    t = threading.Thread(target=_run_fan_test, args=(percent, duration), daemon=True)
+    t.start()
+    return redirect("/")
 
 @app.route("/")
 def index():
@@ -212,10 +294,13 @@ def status():
             for line in sensors_out.splitlines():
                 if 'CPU' in line:
                     continue
-                if any(k in line for k in ['Temp', 'Ambient', 'Inlet']):
+                # Include common Sea of Sensors labels
+                if any(k in line.lower() for k in [
+                    'temp', 'ambient', 'inlet', 'pci', 'chipset', 'p/s', 'vr', 'dimm', 'io board', 'controller']):
                     m = re.search(r"\b(\d{1,3})\b", line)
                     if m:
-                        label = " ".join(line.split()[:2]) if len(line.split()) > 1 else line.split()[0]
+                        parts = line.split()
+                        label = " ".join(parts[:3]) if len(parts) >= 3 else (" ".join(parts) if parts else line)
                         sensors.append({"label": label, "value": m.group(1)})
                 if len(sensors) >= 5:
                     break

@@ -134,9 +134,18 @@ window.addEventListener('load', () => {
       tempChart.data.datasets[0].data = h.tCPU || [];
       tempChart.data.datasets[1].data = h.tGPU || [];
       tempChart.update('none');
+      // Rebuild fan datasets to the stored count if needed
+      const colors = ['#2ecc71','#1abc9c','#9b59b6','#f1c40f','#e67e22','#34495e','#16a085','#8e44ad'];
+      const seriesCount = (h.fSeries && h.fSeries.length) || 0;
+      if (fanChart.data.datasets.length !== seriesCount) {
+        fanChart.data.datasets = Array.from({length: seriesCount}, (_, i) => ({
+          label: `Fan ${i+1} (%)`, data: [], borderColor: colors[i % colors.length], fill: false
+        }));
+      }
       fanChart.data.labels = h.fLabels || [];
       fanChart.data.datasets.forEach((d, i) => { d.data = (h.fSeries && h.fSeries[i]) || []; });
       fanChart.update('none');
+      fanSeriesInit = fanChart.data.datasets.length > 0;
     }
   } catch (_) {}
   poll();

@@ -83,13 +83,21 @@ fi
 get_cpu_temp() {
   if [[ "$USE_IPMI_TEMPS" == "1" && -n "$ILO_IP" && -n "$ILO_USER" ]]; then
     if command -v ipmitool >/dev/null 2>&1; then
-      # Read highest CPU temperature reported via SDRs; adjust grep if needed per platform
+      # Read highest CPU temperature via SDRs; prefer values with trailing C or 'degrees C'
       ipmitool -I lanplus -H "$ILO_IP" -U "$ILO_USER" ${ILO_PASSWORD:+-P "$ILO_PASSWORD"} sdr type Temperature \
-        | awk -F'|' '/CPU/ { if (match($2, /[0-9]+/, m)) print m[0]; }' | sort -nr | head -1
+        | awk 'tolower($0) ~ /cpu|proc|processor/ { \
+            if (match(tolower($0), /([0-9]+)\s*degrees?\s*c/, m)) { print m[1]; } \
+            else if (match(tolower($0), /([0-9]+)c/, m)) { print m[1]; } \
+            else if (match($0, /([0-9]+)/, m)) { print m[1]; } \
+          }' | sort -nr | head -1
       return
     fi
   fi
-  ssh_ilo "show /system1/sensors" | grep "CPU" | awk '{print $2}' | sort -nr | head -1
+  # Fallback to iLO sensors over SSH; prefer values with trailing C
+  ssh_ilo "show /system1/sensors" | awk 'tolower($0) ~ /cpu|proc|processor/ { \
+      if (match(tolower($0), /([0-9]+)c/, m)) { print m[1]; } \
+      else { for (i=1;i<=NF;i++) if (match($i, /^([0-9]+)$/ , n)) print n[1]; } \
+    }' | sort -nr | head -1
 }
 
 get_gpu_temp() {
@@ -143,7 +151,12 @@ apply_fan_speed() {
     if (( DIFF > MAX_STEP )); then DIFF=$MAX_STEP
     elif (( DIFF < -MAX_STEP )); then DIFF=-MAX_STEP; fi
     NEW=$(( CURRENT + DIFF ))
-    ssh_ilo "set /system1/$fan speed=$NEW" >/dev/null
+    # Clamp to [0,100]
+    (( NEW < 0 )) && NEW=0
+    (( NEW > 100 )) && NEW=100
+    if ! ssh_ilo "set /system1/$fan speed=$NEW" >/dev/null 2>&1; then
+      echo "WARN: Failed to set $fan to $NEW" >&2
+    fi
     LAST_SPEEDS[$fan]=$NEW
   done
   # Save current speeds
@@ -156,9 +169,14 @@ apply_fan_speed() {
 while true; do
   CPU_TEMP=$(get_cpu_temp)
   GPU_TEMP=$(get_gpu_temp)
+  # Sanitize temps
+  [[ "$CPU_TEMP" =~ ^[0-9]+$ ]] || CPU_TEMP=0
+  [[ "$GPU_TEMP" =~ ^[0-9]+$ ]] || GPU_TEMP=0
   read CPU_TARGET GPU_TARGET < <(calc_targets "$CPU_TEMP" "$GPU_TEMP")
   FAN_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
   apply_fan_speed $FAN_TARGET
+  # Log a lightweight heartbeat for diagnostics (visible in journalctl)
+  echo "CPU=${CPU_TEMP}C GPU=${GPU_TEMP}C -> target=${FAN_TARGET}% speeds=[${FAN_IDS[*]}]" | sed 's/ /,/g' >&2
   # Optional runtime overrides from JSON
   if command -v jq >/dev/null 2>&1; then
     CI=$(jq -r '(.checkInterval // empty)' "$FAN_CURVE_FILE" 2>/dev/null || true)
