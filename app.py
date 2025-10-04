@@ -372,12 +372,12 @@ def _compute_pids(fans: List[str]) -> List[int]:
             if pid < 0:
                 pid = 0
             pids.append(pid)
-        # Mapping per user: fan2->p1, fan3->p2, fan4->p4
+        # Mapping per user: fan2->p1, fan3->p2, fan4->p3
         mapping = []
         for f in fans:
             if f == "fan2": mapping.append(1)
             elif f == "fan3": mapping.append(2)
-            elif f == "fan4": mapping.append(4)
+            elif f == "fan4": mapping.append(3)
         _COMPUTED_PIDS = mapping
         return _COMPUTED_PIDS
 
@@ -710,7 +710,8 @@ def _run_quick_test(percent: int, duration: int):
         fans = _discover_fans()
         # Apply requested percent
         if ILO_MODDED:
-            pids = _compute_pids(fans)
+            # Use explicit PID order per mapping: fan2->p1, fan3->p2, fan4->p3
+            pids = [1, 2, 3]
             def pct_to_255(p: int) -> int:
                 v = max(0, min(100, int(p)))
                 return max(1, min(255, (v * 255 + 50) // 100))
@@ -723,7 +724,8 @@ def _run_quick_test(percent: int, duration: int):
                 except Exception:
                     pass
                 try:
-                    time.sleep(max(0.0, ILO_CMD_GAP_MS/1000.0))
+                    # Use a slightly larger gap for tests to ensure reliability on iLO
+                    time.sleep(max(0.2, ILO_CMD_GAP_MS/1000.0))
                 except Exception:
                     pass
                 try:
@@ -731,7 +733,7 @@ def _run_quick_test(percent: int, duration: int):
                 except Exception:
                     pass
                 try:
-                    time.sleep(max(0.0, ILO_CMD_GAP_MS/1000.0))
+                    time.sleep(max(0.2, ILO_CMD_GAP_MS/1000.0))
                 except Exception:
                     pass
         else:

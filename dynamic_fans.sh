@@ -20,7 +20,8 @@ ILO_SSH_TTY="${ILO_SSH_TTY:-1}"
 VERBOSE="${VERBOSE:-0}"
 ILO_SSH_TIMEOUT="${ILO_SSH_TIMEOUT:-12}"
 ILO_SSH_PERSIST="${ILO_SSH_PERSIST:-60}"
-ILO_CMD_GAP_MS="${ILO_CMD_GAP_MS:-75}"
+# Default pacing gap between iLO commands (ms); increase for flaky shells
+ILO_CMD_GAP_MS="${ILO_CMD_GAP_MS:-200}"
 ILO_BATCH_SIZE="${ILO_BATCH_SIZE:-1}"
 # Simple millisecond sleep without external deps
 sleep_ms() {
@@ -75,6 +76,24 @@ if (( ${#P_IDS[@]} == 0 )); then
   # Mapping per user: fan2->p1, fan3->p2, fan4->p3
   P_IDS=("1" "2" "3")
 fi
+
+# Helper to send exact max/min with retries and backoff
+send_exact_modded() {
+  local pid=$1 vmax=$2 vmin=$3
+  local attempt gap ok_max ok_min
+  gap=$ILO_CMD_GAP_MS
+  for attempt in 1 2 3; do
+    ok_max=0; ok_min=0
+    if ssh_ilo "fan p $pid max $vmax" >/dev/null 2>&1; then ok_max=1; else echo "WARN: Failed: fan p $pid max $vmax (try $attempt)" >&2; fi
+    sleep_ms "$gap"
+    if ssh_ilo "fan p $pid min $vmin" >/dev/null 2>&1; then ok_min=1; else echo "WARN: Failed: fan p $pid min $vmin (try $attempt)" >&2; fi
+    sleep_ms "$gap"
+    if (( ok_max == 1 && ok_min == 1 )); then return 0; fi
+    # Exponential backoff up to ~800ms
+    gap=$(( gap < 800 ? gap*2 : gap ))
+  done
+  return 1
+}
 
 # Note: We avoid 'show' and 'fans show' for discovery or detection to reduce iLO load.
 
@@ -255,7 +274,9 @@ apply_fan_speed() {
       local fan_id=${P_IDS[$idx]}
       local fan=${FAN_IDS[$idx]:-fan$fan_id}
       CURRENT=${LAST_SPEEDS[$fan]:-20}
-      DIFF=$(( target - CURRENT ))
+      # All fans should follow the same target percent
+      local desired=$target
+      DIFF=$(( desired - CURRENT ))
       if command -v jq >/dev/null 2>&1; then
         MINC=$(jq -r '(.minChange // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
         [[ "$MINC" =~ ^-?[0-9]+$ ]] || MINC=0
@@ -265,7 +286,7 @@ apply_fan_speed() {
       fi
       if (( DIFF > MAX_STEP )); then DIFF=$MAX_STEP
       elif (( DIFF < -MAX_STEP )); then DIFF=-MAX_STEP; fi
-      NEW=$(( CURRENT + DIFF ))
+  NEW=$(( CURRENT + DIFF ))
       (( NEW < 0 )) && NEW=0
       (( NEW > 100 )) && NEW=100
       # Map percent to 1..255 (avoid 0)
@@ -277,24 +298,24 @@ apply_fan_speed() {
         # min is 8 steps below max (clamped)
         local vmin=$(( v255 - 8 ))
         (( vmin < 1 )) && vmin=1
-        # Send exact control as two separate commands with small gap (matches working pattern)
-        if ! ssh_ilo "fan p $fan_id max $v255" >/dev/null 2>&1; then
-          echo "WARN: Failed: fan p $fan_id max $v255" >&2
+        if send_exact_modded "$fan_id" "$v255" "$vmin"; then
+          ((updates_sent++))
+          updated_pids+=("$fan_id")
+          LAST_SPEEDS[$fan]=$NEW
+        else
+          # Leave LAST_SPEEDS unchanged so we retry next loop
+          :
         fi
-        sleep_ms "$ILO_CMD_GAP_MS"
-        if ! ssh_ilo "fan p $fan_id min $vmin" >/dev/null 2>&1; then
-          echo "WARN: Failed: fan p $fan_id min $vmin" >&2
-        fi
-        sleep_ms "$ILO_CMD_GAP_MS"
-        ((updates_sent++))
-        updated_pids+=("$fan_id")
+      else
+        LAST_SPEEDS[$fan]=$NEW
       fi
-      LAST_SPEEDS[$fan]=$NEW
     done
   else
-    for fan in "${FAN_IDS[@]}"; do
-    CURRENT=${LAST_SPEEDS[$fan]:-20}
-    DIFF=$(( target - CURRENT ))
+  for fan in "${FAN_IDS[@]}"; do
+  CURRENT=${LAST_SPEEDS[$fan]:-20}
+  # All fans target the same percent
+  desired=$target
+  DIFF=$(( desired - CURRENT ))
     # Optional minimum change to avoid oscillation
     if command -v jq >/dev/null 2>&1; then
       MINC=$(jq -r '(.minChange // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
