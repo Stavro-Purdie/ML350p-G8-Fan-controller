@@ -194,6 +194,12 @@ _DETECTED_PATH: Optional[str] = None
 _COMPUTED_PIDS: Optional[List[int]] = None
 _ILO_RECENT = deque(maxlen=200)
 _ILO_ACTUALS = {"ts": 0.0, "map": {}}
+_ILO_ACTUALS_LOCK = threading.Lock()
+_ILO_ACTUALS_REFRESHING = False
+
+# Shared cache for other expensive status lookups (gpu info, sensors, etc.)
+_CACHE_LOCK = threading.Lock()
+_CACHE_DATA = {}
 
 # Cross-process lock path to coordinate with the daemon (dynamic_fans.sh)
 _ILO_LOCK_FILE = os.getenv("ILO_LOCK_FILE", "/opt/dynamic-fan-ui/ilo.lock")
@@ -217,6 +223,25 @@ class _CmdItem:
 
 _ILO_QUEUE: "queue.PriorityQueue[_CmdItem]" = queue.PriorityQueue()
 _ILO_SEQ = 0
+
+
+def _get_cached(name: str, ttl: float, loader, default):
+    now = time.time()
+    with _CACHE_LOCK:
+        entry = _CACHE_DATA.get(name)
+        if entry and now - entry.get("ts", 0) < ttl:
+            return entry.get("data", default)
+        # Preserve previous data in case loader fails
+        prev_data = entry.get("data", default) if entry else default
+    try:
+        data = loader()
+        with _CACHE_LOCK:
+            _CACHE_DATA[name] = {"ts": time.time(), "data": data}
+        return data
+    except Exception:
+        if default is not None:
+            return prev_data
+        return prev_data
 
 def _ilo_worker():
     while True:
@@ -340,6 +365,65 @@ def _ilo_try(cmd: str, attempts: int = 2, timeout: Optional[int] = None, priorit
     if last_err:
         raise last_err
     return ""
+
+
+def _trigger_ilo_actuals_refresh(force: bool = False):
+    global _ILO_ACTUALS_REFRESHING
+    now = time.time()
+    with _ILO_ACTUALS_LOCK:
+        age = now - _ILO_ACTUALS.get("ts", 0)
+        if not force and age < 10:
+            return
+        if _ILO_ACTUALS_REFRESHING:
+            return
+        _ILO_ACTUALS_REFRESHING = True
+
+    def worker():
+        global _ILO_ACTUALS_REFRESHING
+        actuals_map = {}
+        try:
+            with _ILO_ACTUALS_LOCK:
+                actuals_map = dict(_ILO_ACTUALS.get("map", {}))
+            try:
+                fans = _discover_fans()
+                if not fans:
+                    fans = FAN_IDS
+            except Exception:
+                fans = FAN_IDS
+            for idx, fan in enumerate(fans):
+                try:
+                    if idx > 0:
+                        time.sleep(5)
+                    out = _ilo_run(f"show /system1/{fan}", timeout=5, priority=9)
+                except Exception:
+                    continue
+                val = None
+                for line in out.splitlines():
+                    if ('=' in line) or (':' in line):
+                        parts = re.split(r"[:=]", line, maxsplit=1)
+                        if len(parts) < 2:
+                            continue
+                        key = parts[0].strip().lower()
+                        if any(k in key for k in ("speed","pwm","duty","duty_cycle","fan_speed","percentage")):
+                            m = re.search(r"(\d{1,3})", parts[1])
+                            if m:
+                                try:
+                                    n = int(m.group(1))
+                                    if 0 <= n <= 100:
+                                        val = n
+                                        break
+                                except Exception:
+                                    pass
+                if val is not None:
+                    actuals_map[fan] = val
+            with _ILO_ACTUALS_LOCK:
+                _ILO_ACTUALS["map"] = actuals_map
+                _ILO_ACTUALS["ts"] = time.time()
+        finally:
+            with _ILO_ACTUALS_LOCK:
+                _ILO_ACTUALS_REFRESHING = False
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _discover_fans() -> List[str]:
@@ -554,13 +638,135 @@ def ilo_set_speed_percent_modded(pid: int, percent: int) -> bool:
 _LAST_CPU_TEMP: Optional[int] = None
 
 
+def _load_gpu_snapshot() -> List[dict]:
+    gpu_info: List[dict] = []
+    fields = (
+        "index,name,pci.bus_id,temperature.gpu,utilization.gpu,utilization.memory,"
+        "utilization.encoder,utilization.decoder,memory.total,memory.used,power.draw,power.limit,"
+        "pstate,fan.speed,clocks.gr,clocks.mem,clocks.video,pcie.link.gen.current,pcie.link.gen.max,"
+        "pcie.link.width.current,pcie.link.width.max"
+    )
+    base = subprocess.check_output(
+        f"nvidia-smi --query-gpu={fields} --format=csv,noheader,nounits",
+        shell=True, text=True, timeout=3
+    )
+    for line in base.splitlines():
+        p = [q.strip() for q in line.split(',')]
+        if len(p) < 20:
+            continue
+        gpu_info.append({
+            "index": p[0], "name": p[1], "bus_id": p[2], "temperature": p[3],
+            "util_gpu": p[4], "util_mem": p[5], "util_enc": p[6] if len(p)>6 else "",
+            "util_dec": p[7] if len(p)>7 else "", "mem_total": p[8], "mem_used": p[9],
+            "power_draw": p[10], "power_limit": p[11], "pstate": p[12], "fan_speed": p[13],
+            "clocks_gr": p[14], "clocks_mem": p[15], "clocks_video": p[16],
+            "pcie_gen_cur": p[17], "pcie_gen_max": p[18],
+            "pcie_width_cur": p[19] if len(p)>19 else "", "pcie_width_max": p[20] if len(p)>20 else "",
+        })
+
+    # Attach encoder session counts if available
+    try:
+        enc = subprocess.check_output(
+            "nvidia-smi encodersessions -q 2>/dev/null | cat",
+            shell=True, text=True, timeout=3
+        )
+        current_bus = None
+        counts = {}
+        for line in enc.splitlines():
+            m = re.search(r"GPU\s+([0-9a-fA-F:]+)", line)
+            if m:
+                current_bus = m.group(1)
+                counts.setdefault(current_bus, 0)
+            if "Session Id" in line and current_bus:
+                counts[current_bus] = counts.get(current_bus, 0) + 1
+        if counts and gpu_info:
+            for g in gpu_info:
+                g["encoder_sessions"] = counts.get(g.get("bus_id"), 0)
+    except Exception:
+        pass
+    return gpu_info
+
+
+def _get_gpu_snapshot() -> List[dict]:
+    return _get_cached("gpu_snapshot", 10.0, _load_gpu_snapshot, [])
+
+
+def _load_lm_sensors() -> dict:
+    out = subprocess.check_output(["sensors"], text=True, timeout=4)
+    entries: List[dict] = []
+    package_temp: Optional[str] = None
+    highest_temp: Optional[float] = None
+    for raw in out.splitlines():
+        line = raw.strip()
+        if not line or ':' not in line:
+            continue
+        m = re.match(r"([^:]+):\s*\+?([0-9.]+)°C", line)
+        if not m:
+            continue
+        label = m.group(1).strip()
+        val_str = m.group(2)
+        entries.append({"label": label, "value": val_str})
+        try:
+            val = float(val_str)
+        except Exception:
+            val = None
+        if val is not None:
+            if label.lower().startswith("package id"):
+                package_temp = str(int(round(val)))
+            if highest_temp is None or val > highest_temp:
+                highest_temp = val
+    if package_temp is None and highest_temp is not None:
+        package_temp = str(int(round(highest_temp)))
+    return {"package": package_temp or "", "entries": entries}
+
+
+def _get_lm_sensors_summary() -> dict:
+    return _get_cached("lm_sensors", 5.0, _load_lm_sensors, {"package": "", "entries": []})
+
+
+def _load_additional_sensors() -> List[dict]:
+    sensors: List[dict] = []
+    if USE_IPMI_TEMPS:
+        out = subprocess.check_output(
+            ["bash", "-lc", f"ipmitool -I lanplus -H {ILO_IP} -U {ILO_USER} {'-P '+ILO_PASSWORD if ILO_PASSWORD else ''} sdr type Temperature"],
+            text=True, timeout=3
+        )
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) >= 2 and 'CPU' not in parts[0]:
+                m = re.search(r"(\d+)", parts[1])
+                if m:
+                    sensors.append({"label": parts[0], "value": m.group(1)})
+            if len(sensors) >= 5:
+                break
+    else:
+        summary = _get_lm_sensors_summary()
+        for item in summary.get("entries", [])[:6]:
+            sensors.append({"label": item.get("label", ""), "value": item.get("value", "")})
+    return sensors
+
+
+def _get_additional_sensors() -> List[dict]:
+    return _get_cached("extra_sensors", 20.0, _load_additional_sensors, [])
+
+
+def _load_service_status() -> dict:
+    svc = {"present": False, "active": False}
+    if shutil.which("systemctl"):
+        out = subprocess.check_output(["systemctl", "is-active", "dynamic-fans.service"], text=True, timeout=2).strip()
+        svc = {"present": True, "active": (out == "active")}
+    return svc
+
+
+def _get_service_status() -> dict:
+    return _get_cached("service_status", 5.0, _load_service_status, {"present": False, "active": False})
+
+
 def get_temps():
     cpu_temp = ""
-    # CPU from IPMI or iLO sensors
     if USE_IPMI_TEMPS:
         try:
             pw = f"-P {ILO_PASSWORD}" if ILO_PASSWORD else ""
-            # Escape braces in awk with double {{ }} inside f-string
             cmd_str = (
                 f"ipmitool -I lanplus -H {ILO_IP} -U {ILO_USER} {pw} sdr type Temperature "
                 "| awk -F'|' '/CPU/ {{ if (match($2, /[0-9]+/, m)) print m[0]; }}' | sort -nr | head -1"
@@ -570,13 +776,22 @@ def get_temps():
         except Exception:
             cpu_temp = ""
     if not cpu_temp:
-        try:
-            # iLO CPU temp is typically under /system1/sensor2, parse CurrentReading
-            out = _ilo_run("show /system1/sensor2", priority=9)
-            m = re.search(r"CurrentReading\s*=\s*(\d{1,3})", out, re.IGNORECASE)
-            cpu_temp = m.group(1) if m else ""
-        except Exception:
-            cpu_temp = ""
+        summary = _get_lm_sensors_summary()
+        cpu_temp = summary.get("package", "") or ""
+        # As a fallback, reuse the hottest entry if package missing
+        if not cpu_temp:
+            try:
+                entries = summary.get("entries", [])
+                hottest = 0
+                for item in entries:
+                    try:
+                        hottest = max(hottest, int(round(float(item.get("value", "0")))))
+                    except Exception:
+                        continue
+                if hottest > 0:
+                    cpu_temp = str(hottest)
+            except Exception:
+                pass
     # Retain last non-zero CPU temp if we got an empty/zero reading
     try:
         global _LAST_CPU_TEMP
@@ -587,23 +802,26 @@ def get_temps():
             cpu_temp = str(_LAST_CPU_TEMP)
     except Exception:
         pass
-    # GPU via nvidia-smi
+    # GPU via cached snapshot
     gpu_temp = ""; gpu_name = ""; gpu_power = ""
     try:
-        out = subprocess.check_output(
-            "nvidia-smi --query-gpu=temperature.gpu,name,power.draw --format=csv,noheader,nounits",
-            shell=True, text=True, timeout=3
-        )
-        best_t = -1
-        for line in out.splitlines():
-            parts = [p.strip() for p in line.split(',')]
-            if parts and parts[0].isdigit():
-                t = int(parts[0])
-                if t > best_t:
-                    best_t = t
-                    gpu_temp = str(t)
-                    gpu_name = parts[1] if len(parts) > 1 else ""
-                    gpu_power = parts[2] if len(parts) > 2 else ""
+        snapshot = _get_gpu_snapshot()
+        if snapshot:
+            best = None
+            best_temp = -1
+            for g in snapshot:
+                raw = g.get("temperature", "")
+                try:
+                    t = int(re.findall(r"\d+", str(raw))[0])
+                except Exception:
+                    t = -1
+                if t > best_temp:
+                    best_temp = t
+                    best = g
+            if best:
+                gpu_temp = str(best_temp if best_temp >= 0 else "")
+                gpu_name = best.get("name", "")
+                gpu_power = best.get("power_draw", "")
     except Exception:
         pass
     return cpu_temp, gpu_temp, gpu_name, gpu_power
@@ -639,142 +857,21 @@ def index():
 @app.route("/status")
 def status():
     cpu, gpu, gpu_name, gpu_power = get_temps()
-    sensors = []
-    # Collect a few sensors (best-effort)
-    try:
-        if USE_IPMI_TEMPS:
-            out = subprocess.check_output(
-                ["bash", "-lc", f"ipmitool -I lanplus -H {ILO_IP} -U {ILO_USER} {'-P '+ILO_PASSWORD if ILO_PASSWORD else ''} sdr type Temperature"],
-                text=True, timeout=3
-            )
-            for line in out.splitlines():
-                parts = [p.strip() for p in line.split('|')]
-                if len(parts) >= 2 and 'CPU' not in parts[0]:
-                    m = re.search(r"(\d+)", parts[1])
-                    if m:
-                        sensors.append({"label": parts[0], "value": m.group(1)})
-                if len(sensors) >= 5:
-                    break
-        else:
-            try:
-                stext = _ilo_run("show /system1/sensor2", priority=9)
-                m = re.search(r"CurrentReading\s*=\s*(\d{1,3})", stext, re.IGNORECASE)
-                if m:
-                    sensors.append({"label": "CPU (sensor2)", "value": m.group(1)})
-            except Exception:
-                pass
-    except Exception:
-        sensors = []
+    sensors = _get_additional_sensors()
+    gpu_info = _get_gpu_snapshot()
+    svc = _get_service_status()
 
-    # Detailed GPU info (best-effort)
-    gpu_info = []
-    try:
-        fields = (
-            "index,name,pci.bus_id,temperature.gpu,utilization.gpu,utilization.memory,"
-            "utilization.encoder,utilization.decoder,memory.total,memory.used,power.draw,power.limit,"
-            "pstate,fan.speed,clocks.gr,clocks.mem,clocks.video,pcie.link.gen.current,pcie.link.gen.max,"
-            "pcie.link.width.current,pcie.link.width.max"
-        )
-        base = subprocess.check_output(
-            f"nvidia-smi --query-gpu={fields} --format=csv,noheader,nounits",
-            shell=True, text=True, timeout=3
-        )
-        for line in base.splitlines():
-            p = [q.strip() for q in line.split(',')]
-            if len(p) < 20:
-                continue
-            gpu_info.append({
-                "index": p[0], "name": p[1], "bus_id": p[2], "temperature": p[3],
-                "util_gpu": p[4], "util_mem": p[5], "util_enc": p[6] if len(p)>6 else "",
-                "util_dec": p[7] if len(p)>7 else "", "mem_total": p[8], "mem_used": p[9],
-                "power_draw": p[10], "power_limit": p[11], "pstate": p[12], "fan_speed": p[13],
-                "clocks_gr": p[14], "clocks_mem": p[15], "clocks_video": p[16],
-                "pcie_gen_cur": p[17], "pcie_gen_max": p[18],
-                "pcie_width_cur": p[19] if len(p)>19 else "", "pcie_width_max": p[20] if len(p)>20 else "",
-            })
-    except Exception:
-        gpu_info = []
-
-    # NVENC sessions (best-effort, may require supported driver)
-    try:
-        enc = subprocess.check_output(
-            "nvidia-smi encodersessions -q 2>/dev/null | cat",
-            shell=True, text=True, timeout=3
-        )
-        # Count sessions per bus id
-        current_bus = None
-        counts = {}
-        for line in enc.splitlines():
-            m = re.search(r"GPU\s+([0-9a-fA-F:]+)", line)
-            if m:
-                current_bus = m.group(1)
-                counts.setdefault(current_bus, 0)
-            if "Session Id" in line and current_bus:
-                counts[current_bus] = counts.get(current_bus, 0) + 1
-        if counts and gpu_info:
-            for g in gpu_info:
-                g["encoder_sessions"] = counts.get(g.get("bus_id"), 0)
-    except Exception:
-        pass
-
-    # Service status (best-effort)
-    svc = {"present": False, "active": False}
-    try:
-        if shutil.which("systemctl"):
-            out = subprocess.check_output(["systemctl", "is-active", "dynamic-fans.service"], text=True, timeout=2).strip()
-            svc = {"present": True, "active": (out == "active")}
-    except Exception:
-        pass
-
-    # iLO actuals: prefer per-fan object query to avoid 'fan info'; rate-limited
-    ilo_map = {}
-    try:
-        now = time.time()
-        if now - _ILO_ACTUALS.get("ts", 0) > 10:
-            # Start with previous map so values persist if iLO is temporarily unreachable
-            prev_map = dict(_ILO_ACTUALS.get("map", {}))
-            actuals_map: dict = dict(prev_map)
-            # Query discovered fans; fall back to configured FAN_IDS
-            try:
-                fans = _discover_fans()
-                if not fans:
-                    fans = FAN_IDS
-            except Exception:
-                fans = FAN_IDS
-            for idx, fan in enumerate(fans):
-                try:
-                    if idx > 0:
-                        # 5-second separation between show commands
-                        time.sleep(5)
-                    out = _ilo_run(f"show /system1/{fan}", timeout=5, priority=9)
-                except Exception:
-                    # Keep previous value if present
-                    continue
-                # Look for a percent-like property among known candidates
-                val = None
-                for line in out.splitlines():
-                    if ('=' in line) or (':' in line):
-                        parts = re.split(r"[:=]", line, maxsplit=1)
-                        if len(parts) < 2:
-                            continue
-                        key = parts[0].strip().lower()
-                        if any(k in key for k in ("speed","pwm","duty","duty_cycle","fan_speed","percentage")):
-                            m = re.search(r"(\d{1,3})", parts[1])
-                            if m:
-                                try:
-                                    n = int(m.group(1))
-                                    if 0 <= n <= 100:
-                                        val = n
-                                        break
-                                except Exception:
-                                    pass
-                if val is not None:
-                    actuals_map[fan] = val
-            _ILO_ACTUALS["ts"] = now
-            _ILO_ACTUALS["map"] = actuals_map
+    # Ensure background refresh kicked off for iLO actuals if stale
+    with _ILO_ACTUALS_LOCK:
         ilo_map = dict(_ILO_ACTUALS.get("map", {}))
-    except Exception:
-        ilo_map = {}
+        ilo_ts = _ILO_ACTUALS.get("ts", 0)
+        refreshing = _ILO_ACTUALS_REFRESHING
+    now = time.time()
+    if not ilo_map and ilo_ts == 0:
+        _trigger_ilo_actuals_refresh(force=True)
+    elif now - ilo_ts > 10 and not refreshing:
+        _trigger_ilo_actuals_refresh()
+    ilo_age = int(now - ilo_ts) if ilo_ts else -1
 
     # Fan bits snapshot for UI comparison
     try:
@@ -804,7 +901,7 @@ def status():
     return jsonify({
         "cpu": cpu, "gpu": gpu, "gpu_name": gpu_name, "gpu_power": gpu_power,
     "fans": get_fan_speeds(), "fan_bits": fan_bits, "fans_ids": FAN_IDS,
-        "ilo_fan_percents": ilo_map, "ilo_actuals_age": int(time.time() - _ILO_ACTUALS.get("ts", 0)),
+        "ilo_fan_percents": ilo_map, "ilo_actuals_age": max(0, ilo_age),
         "ilo_queue_depth": qdepth, "ilo_last_cmd": last_obj,
         "sensors": sensors, "gpu_info": gpu_info,
         "service": svc, "ok": True,

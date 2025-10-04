@@ -227,16 +227,36 @@ get_cpu_temp() {
       return
     fi
   fi
-  # Fallback to iLO sensor2 over SSH (CPU temp)
+  # Fallback to lm-sensors output (Package temperature)
+  if ! command -v sensors >/dev/null 2>&1; then
+    echo "$LAST_CPU_VAL"
+    return
+  fi
   local now_ts; now_ts=$(date +%s)
-  if (( LAST_CPU_TS > 0 && now_ts - LAST_CPU_TS < 20 && LAST_CPU_VAL > 0 )); then
+  if (( LAST_CPU_TS > 0 && now_ts - LAST_CPU_TS < 5 && LAST_CPU_VAL > 0 )); then
     echo "$LAST_CPU_VAL"; return
   fi
-  local val
-  val=$(ssh_ilo "show /system1/sensor2" \
-    | grep -i "^\s*CurrentReading=" \
-    | sed -n -E 's/.*CurrentReading=([0-9]{1,3}).*/\1/p' \
-    | head -1)
+  local sensors_out
+  sensors_out=$(sensors 2>/dev/null)
+  local val pkg hottest
+  pkg=$(echo "$sensors_out" | awk '
+    /Package id/ {
+      if (match($0, /\+([0-9]+)(\.[0-9]+)?°C/, m)) {
+        print m[1]; exit
+      }
+    }')
+  if [[ -n "$pkg" ]]; then
+    val=$pkg
+  else
+    hottest=$(echo "$sensors_out" | awk '
+      {
+        if (match($0, /\+([0-9]+)(\.[0-9]+)?°C/, m)) {
+          if (m[1] + 0 > max) max = m[1] + 0
+        }
+      }
+      END { if (max > 0) print int(max); }')
+    [[ -n "$hottest" ]] && val=$hottest || val=""
+  fi
   if [[ "$val" =~ ^[0-9]+$ ]]; then
     LAST_CPU_VAL=$val
     LAST_CPU_TS=$now_ts
