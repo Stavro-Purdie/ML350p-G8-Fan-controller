@@ -34,11 +34,12 @@ def get_temps():
         base_ssh = ["ssh", "-o", "StrictHostKeyChecking=no"]
         if ILO_SSH_LEGACY:
             base_ssh += [
-                "-o", "KexAlgorithms=+diffie-hellman-group14-sha1",
+                "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1",
                 "-o", "HostKeyAlgorithms=+ssh-rsa",
                 "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
                 "-o", "PubkeyAcceptedKeyTypes=+ssh-rsa",
-                "-o", "Ciphers=+aes128-cbc",
+                "-o", "Ciphers=+aes128-cbc,3des-cbc",
+                "-o", "MACs=+hmac-sha1",
             ]
         if ILO_SSH_KEY and os.path.exists(ILO_SSH_KEY):
             base_ssh += ["-i", ILO_SSH_KEY]
@@ -79,11 +80,12 @@ def test_ilo():
     cmd = ["ssh", "-o", "StrictHostKeyChecking=no"]
     if ILO_SSH_LEGACY:
         cmd += [
-            "-o", "KexAlgorithms=+diffie-hellman-group14-sha1",
+            "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1",
             "-o", "HostKeyAlgorithms=+ssh-rsa",
             "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
             "-o", "PubkeyAcceptedKeyTypes=+ssh-rsa",
-            "-o", "Ciphers=+aes128-cbc",
+            "-o", "Ciphers=+aes128-cbc,3des-cbc",
+            "-o", "MACs=+hmac-sha1",
         ]
     if ILO_SSH_KEY and os.path.exists(ILO_SSH_KEY):
         cmd += ["-i", ILO_SSH_KEY]
@@ -194,11 +196,12 @@ def status():
             base_ssh = ["ssh", "-o", "StrictHostKeyChecking=no"]
             if ILO_SSH_LEGACY:
                 base_ssh += [
-                    "-o", "KexAlgorithms=+diffie-hellman-group14-sha1",
+                    "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1",
                     "-o", "HostKeyAlgorithms=+ssh-rsa",
                     "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
                     "-o", "PubkeyAcceptedKeyTypes=+ssh-rsa",
-                    "-o", "Ciphers=+aes128-cbc",
+                    "-o", "Ciphers=+aes128-cbc,3des-cbc",
+                    "-o", "MACs=+hmac-sha1",
                 ]
             if ILO_SSH_KEY and os.path.exists(ILO_SSH_KEY):
                 base_ssh += ["-i", ILO_SSH_KEY]

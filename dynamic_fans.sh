@@ -36,11 +36,12 @@ if [[ -n "$ILO_SSH_KEY" && -f "$ILO_SSH_KEY" ]]; then
 fi
 if [[ "$ILO_SSH_LEGACY" == "1" ]]; then
   SSH_OPTS+=(
-    "-o" "KexAlgorithms=+diffie-hellman-group14-sha1"
+    "-o" "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1"
     "-o" "HostKeyAlgorithms=+ssh-rsa"
     "-o" "PubkeyAcceptedAlgorithms=+ssh-rsa"
     "-o" "PubkeyAcceptedKeyTypes=+ssh-rsa"
-    "-o" "Ciphers=+aes128-cbc"
+    "-o" "Ciphers=+aes128-cbc,3des-cbc"
+    "-o" "MACs=+hmac-sha1"
   )
 fi
 ssh_ilo() {

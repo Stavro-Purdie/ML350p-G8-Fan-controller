@@ -255,11 +255,12 @@ connectivity_check() {
   if [[ $rc -ne 0 || "$out" != "ok" ]]; then
     echo "Modern SSH failed; retrying with legacy algorithms..."
     ssh_base+=(
-      -o KexAlgorithms=+diffie-hellman-group14-sha1 \
+      -o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1 \
       -o HostKeyAlgorithms=+ssh-rsa \
       -o PubkeyAcceptedAlgorithms=+ssh-rsa \
       -o PubkeyAcceptedKeyTypes=+ssh-rsa \
-      -o Ciphers=+aes128-cbc
+      -o Ciphers=+aes128-cbc,3des-cbc \
+      -o MACs=+hmac-sha1
     )
     cmd=("${ssh_base[@]}" "$ILO_USER@$ILO_IP" echo ok)
     if [[ -n "$ILO_PASSWORD" && $(command -v sshpass) ]]; then
