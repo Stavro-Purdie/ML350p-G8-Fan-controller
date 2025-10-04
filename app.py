@@ -14,6 +14,9 @@ ILO_IP = os.getenv("ILO_IP", "192.168.1.100")
 ILO_PASSWORD = os.getenv("ILO_PASSWORD", "")
 USE_IPMI_TEMPS = os.getenv("USE_IPMI_TEMPS", "0") == "1"
 ILO_SSH_LEGACY = os.getenv("ILO_SSH_LEGACY", "0") == "1"
+ILO_MODDED = os.getenv("ILO_MODDED", "0") == "1"
+FAN_P_IDS = [p for p in os.getenv("FAN_P_IDS_STR", "").split() if p]
+ILO_PID_OFFSET = int(os.getenv("ILO_PID_OFFSET", "-1"))
 
 FAN_IDS_ENV = os.getenv("FAN_IDS_STR", "").strip()
 if FAN_IDS_ENV:
@@ -168,18 +171,56 @@ def _run_fan_test(percent: int, duration: int):
         if ILO_PASSWORD:
             ssh_cmd = ["sshpass", "-p", ILO_PASSWORD] + ssh_cmd
         # Apply test speed
-        for fan in FAN_IDS:
-            try:
-                subprocess.run(ssh_cmd + [f"set /system1/{fan} speed={percent}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-            except Exception:
-                pass
+        if ILO_MODDED:
+            # Map percent to 1..255 with min=max for exact control
+            v255 = max(1, min(255, int(round(percent * 255 / 100.0))))
+            if FAN_P_IDS:
+                pids = FAN_P_IDS
+            else:
+                pids = []
+                for f in FAN_IDS:
+                    try:
+                        num = int(f.replace("fan", ""))
+                        pids.append(str(max(0, num + ILO_PID_OFFSET)))
+                    except Exception:
+                        pids.append("0")
+            for pid in pids:
+                try:
+                    subprocess.run(ssh_cmd + [f"fan p {pid} min {v255}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                    subprocess.run(ssh_cmd + [f"fan p {pid} max {v255}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                except Exception:
+                    pass
+        else:
+            for fan in FAN_IDS:
+                try:
+                    subprocess.run(ssh_cmd + [f"set /system1/{fan} speed={percent}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                except Exception:
+                    pass
         time.sleep(duration)
         # Drop to a safe level before resuming control
-        for fan in FAN_IDS:
-            try:
-                subprocess.run(ssh_cmd + ["set", f"/system1/{fan}", "speed=30"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-            except Exception:
-                pass
+        if ILO_MODDED:
+            if FAN_P_IDS:
+                pids = FAN_P_IDS
+            else:
+                pids = []
+                for f in FAN_IDS:
+                    try:
+                        num = int(f.replace("fan", ""))
+                        pids.append(str(max(0, num + ILO_PID_OFFSET)))
+                    except Exception:
+                        pids.append("0")
+            for pid in pids:
+                try:
+                    subprocess.run(ssh_cmd + [f"fan p {pid} min 76"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)  # ~30%
+                    subprocess.run(ssh_cmd + [f"fan p {pid} max 76"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                except Exception:
+                    pass
+        else:
+            for fan in FAN_IDS:
+                try:
+                    subprocess.run(ssh_cmd + ["set", f"/system1/{fan}", "speed=30"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                except Exception:
+                    pass
         if was_active:
             subprocess.Popen(["systemctl", "start", "dynamic-fans.service"])  # resume
     finally:
@@ -456,6 +497,38 @@ def status():
         "gpu_info": gpu_info,
         "ok": True,
     })
+
+@app.route("/debug_ilo_fans")
+def debug_ilo_fans():
+    prefixes = ["/system1", "/system1/fans1"]
+    base = build_ssh_base()
+    ssh_cmd = base + [f"{ILO_USER}@{ILO_IP}"]
+    if ILO_PASSWORD:
+        ssh_cmd = ["sshpass", "-p", ILO_PASSWORD] + ssh_cmd
+    result = []
+    for pref in prefixes:
+        try:
+            out = subprocess.check_output(ssh_cmd + [f"show {pref}"], text=True, timeout=3)
+        except Exception as e:
+            result.append({"prefix": pref, "error": str(e), "fans": []})
+            continue
+        fans = []
+        tokens = set()
+        for line in out.split():
+            if re.match(r"fan\d+", line, re.IGNORECASE):
+                tokens.add(line.strip())
+        for fan in sorted(tokens):
+            try:
+                attrs = subprocess.check_output(ssh_cmd + [f"show -a {pref}/{fan}"], text=True, timeout=3)
+            except Exception:
+                try:
+                    attrs = subprocess.check_output(ssh_cmd + [f"show {pref}/{fan}"], text=True, timeout=3)
+                except Exception as e2:
+                    fans.append({"name": fan, "error": str(e2)})
+                    continue
+            fans.append({"name": fan, "attrs": attrs.splitlines()})
+        result.append({"prefix": pref, "fans": fans})
+    return jsonify(result)
 
 @app.route("/export_status")
 def export_status():

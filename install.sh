@@ -32,6 +32,9 @@ ILO_SSH_LEGACY=${ILO_SSH_LEGACY:-0}
 START_NOW=${START_NOW:-yes}
 FAN_IDS_STR=${FAN_IDS_STR:-}
 RUN_RAMP_TEST=${RUN_RAMP_TEST:-yes}
+ILO_MODDED=${ILO_MODDED:-0}
+FAN_P_IDS_STR=${FAN_P_IDS_STR:-}
+ILO_PID_OFFSET=${ILO_PID_OFFSET:--1}
 
 echo "\n=== ML350p-G8-Fan-controller Installer ==="
 prompt "iLO IP" "$ILO_IP" ILO_IP
@@ -70,6 +73,17 @@ if [[ "$start_now" =~ ^[Yy]$ ]]; then START_NOW=yes; else START_NOW=no; fi
 read -r -p "Run a brief fan ramp test now (100% for 10s)? (y/n) [y]: " ramp
 ramp=${ramp:-y}
 if [[ "$ramp" =~ ^[Yy]$ ]]; then RUN_RAMP_TEST=yes; else RUN_RAMP_TEST=no; fi
+read -r -p "Is your iLO modded for 1-255 fan control (fan p <id> ...)? (y/n) [n]: " modded
+modded=${modded:-n}
+if [[ "$modded" =~ ^[Yy]$ ]]; then ILO_MODDED=1; else ILO_MODDED=0; fi
+if [[ "$ILO_MODDED" == "1" ]]; then
+  read -r -p "Map P-IDs (space-separated) for installed fans (e.g., for fan2 fan3 fan4 enter: 2 3 4). Leave blank to derive: " pids
+  if [[ -n "$pids" ]]; then
+    FAN_P_IDS_STR="$pids"
+  fi
+  read -r -p "P-ID offset (fanN -> p(N+offset), default -1 because iLO uses 0-based p-ids): " pid_off
+  ILO_PID_OFFSET=${pid_off:--1}
+fi
 
 create_dirs() {
   echo "Creating directories..."
@@ -153,6 +167,9 @@ Environment=MAX_STEP=10
 Environment=USE_IPMI_TEMPS=$USE_IPMI_TEMPS
 Environment=ILO_SSH_LEGACY=$ILO_SSH_LEGACY
 Environment=FAN_IDS_STR=$FAN_IDS_STR
+Environment=ILO_MODDED=$ILO_MODDED
+Environment=FAN_P_IDS_STR=$FAN_P_IDS_STR
+Environment=ILO_PID_OFFSET=$ILO_PID_OFFSET
 EOF
 
   # UI overrides
@@ -168,6 +185,9 @@ Environment=ILO_PASSWORD=$ILO_PASSWORD
 Environment=USE_IPMI_TEMPS=$USE_IPMI_TEMPS
 Environment=ILO_SSH_LEGACY=$ILO_SSH_LEGACY
 Environment=FAN_IDS_STR=$FAN_IDS_STR
+Environment=ILO_MODDED=$ILO_MODDED
+Environment=FAN_P_IDS_STR=$FAN_P_IDS_STR
+Environment=ILO_PID_OFFSET=$ILO_PID_OFFSET
 WorkingDirectory=$APP_DIR/app
 EOF
 
@@ -339,26 +359,45 @@ fan_ramp_test() {
       echo " ✓ Found $f"
     fi
   done
-  for f in "${fans[@]}"; do
-    echo " - $f => 100%"
-    set +e
-    local out rc
-    out=$("${base[@]}" "set /system1/$f speed=100" 2>&1); rc=$?
-    if [[ $rc -ne 0 ]]; then
-      out=$("${base[@]}" "set /system1/fans1/$f speed=100" 2>&1); rc=$?
+  if [[ "$ILO_MODDED" == "1" ]]; then
+    # Map to P-IDs
+    local pids
+    if [[ -n "$FAN_P_IDS_STR" ]]; then pids=($FAN_P_IDS_STR); else
+      # Derive from names fanN -> N
+      for f in "${fans[@]}"; do pids+=("${f#fan}"); done
     fi
-    set -e
-    if [[ $rc -ne 0 ]]; then
-      echo " ! Failed to set $f to 100%: $out"
-    fi
-    # Read back for confirmation if possible
-    set +e
-    local after
-  after=$("${base[@]}" "show /system1/$f" 2>/dev/null | grep -i speed | head -1)
-  [[ -z "$after" ]] && after=$("${base[@]}" "show /system1/fans1/$f" 2>/dev/null | grep -i speed | head -1)
-    set -e
-    [[ -n "$after" ]] && echo "   > $after"
-  done
+    local idx=0
+    for f in "${fans[@]}"; do
+      local pid=${pids[$idx]}
+      echo " - p $pid (from $f) => 255"
+      set +e
+      "${base[@]}" "fan p $pid min 255" >/dev/null 2>&1
+      "${base[@]}" "fan p $pid max 255" >/dev/null 2>&1
+      set -e
+      ((idx++))
+    done
+  else
+    for f in "${fans[@]}"; do
+      echo " - $f => 100%"
+      set +e
+      local out rc
+      out=$("${base[@]}" "set /system1/$f speed=100" 2>&1); rc=$?
+      if [[ $rc -ne 0 ]]; then
+        out=$("${base[@]}" "set /system1/fans1/$f speed=100" 2>&1); rc=$?
+      fi
+      set -e
+      if [[ $rc -ne 0 ]]; then
+        echo " ! Failed to set $f to 100%: $out"
+      fi
+      # Read back for confirmation if possible
+      set +e
+      local after
+      after=$("${base[@]}" "show /system1/$f" 2>/dev/null | grep -i speed | head -1)
+      [[ -z "$after" ]] && after=$("${base[@]}" "show /system1/fans1/$f" 2>/dev/null | grep -i speed | head -1)
+      set -e
+      [[ -n "$after" ]] && echo "   > $after"
+    done
+  fi
   sleep 10
   for f in "${fans[@]}"; do
     echo " - $f => 30%"

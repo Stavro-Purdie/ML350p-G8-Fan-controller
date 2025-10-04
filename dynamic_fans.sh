@@ -12,13 +12,35 @@ ILO_PASSWORD="${ILO_PASSWORD:-}"
 USE_IPMI_TEMPS="${USE_IPMI_TEMPS:-0}"
 # Enable legacy SSH algorithms for older iLO (OpenSSH 8.8+ compatibility)
 ILO_SSH_LEGACY="${ILO_SSH_LEGACY:-0}"
+ILO_MODDED="${ILO_MODDED:-0}"
+ILO_PID_OFFSET="${ILO_PID_OFFSET:--1}"
 
 FAN_IDS=("fan1" "fan2" "fan3" "fan4" "fan5")
 # Allow overriding the base path(s) to fan objects
 FAN_PATHS=("/system1" "/system1/fans1")
+# Candidate property names to try if not specified
+PROP_CANDIDATES=("speed" "pwm" "duty" "duty_cycle" "fan_speed" "percentage")
+# Allow override of fan property
+ILO_FAN_PROP="${ILO_FAN_PROP:-}"
 # Allow override via space-separated env string, e.g. FAN_IDS_STR="fan1 fan2 fan3 fan4 fan5"
 if [[ -n "${FAN_IDS_STR:-}" ]]; then
   read -r -a FAN_IDS <<<"$FAN_IDS_STR"
+fi
+# Optional numeric P-IDs for modded iLO commands
+P_IDS=()
+if [[ -n "${FAN_P_IDS_STR:-}" ]]; then
+  read -r -a P_IDS <<<"$FAN_P_IDS_STR"
+fi
+# Derive P-IDs from FAN_IDS if not provided (strip 'fan' prefix)
+if (( ${#P_IDS[@]} == 0 )); then
+  for f in "${FAN_IDS[@]}"; do
+    if [[ "$f" =~ ^fan([0-9]+)$ ]]; then
+      num=${BASH_REMATCH[1]}
+      pid=$(( num + ILO_PID_OFFSET ))
+      (( pid < 0 )) && pid=0
+      P_IDS+=("$pid")
+    fi
+  done
 fi
 
 # Attempt auto-discovery of fan objects if FAN_IDS appears invalid
@@ -41,9 +63,44 @@ auto_discover_fans() {
   done
 }
 
+# Discover a usable fan property (percent-like) from iLO output
+detect_fan_prop() {
+  local fan_sample="${FAN_IDS[0]}" prop=""
+  for prefix in "${FAN_PATHS[@]}"; do
+    local out
+    out=$(ssh_ilo "show -a $prefix/$fan_sample" 2>/dev/null || ssh_ilo "show $prefix/$fan_sample" 2>/dev/null || true)
+    if [[ -z "$out" ]]; then continue; fi
+    # Look for key=value style fields with names containing speed/pwm/duty and numeric 0-100
+    prop=$(echo "$out" | awk '
+      BEGIN{IGNORECASE=1}
+      {
+        # split on separators
+        n=split($0, a, /[=:]/);
+        if (n>=2) {
+          key=a[1]; val=a[2];
+          gsub(/^[ \\t]+|[ \\t]+$/, "", key);
+          gsub(/^[ \\t]+|[ \\t]+$/, "", val);
+          if (key ~ /(speed|pwm|duty)/ && match(val, /[0-9]{1,3}/, m)) {
+            v=m[0]+0; if (v>=0 && v<=100) { print tolower(key); exit; }
+          }
+        }
+      }
+    ' | head -1)
+    if [[ -n "$prop" ]]; then
+      echo "Detected fan property: $prop on $prefix/$fan_sample" >&2
+      ILO_FAN_PROP="$prop"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Validate that first fan is queryable; otherwise try to discover
 if ! ssh_ilo "show /system1/${FAN_IDS[0]}" >/dev/null 2>&1 && ! ssh_ilo "show /system1/fans1/${FAN_IDS[0]}" >/dev/null 2>&1; then
   auto_discover_fans
+fi
+if [[ -z "$ILO_FAN_PROP" ]]; then
+  detect_fan_prop || true
 fi
 
 CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
@@ -175,13 +232,50 @@ apply_fan_speed() {
     local fan=$1 val=$2
     local ok=1
     for prefix in "${FAN_PATHS[@]}"; do
-      if ssh_ilo "set $prefix/$fan speed=$val" >/dev/null 2>&1; then
-        ok=0; break
+      if [[ -n "$ILO_FAN_PROP" ]]; then
+        if ssh_ilo "set $prefix/$fan $ILO_FAN_PROP=$val" >/dev/null 2>&1; then ok=0; break; fi
       fi
+      for prop in "${PROP_CANDIDATES[@]}"; do
+        if ssh_ilo "set $prefix/$fan $prop=$val" >/dev/null 2>&1; then ok=0; ILO_FAN_PROP="$prop"; break; fi
+      done
+      [[ $ok -eq 0 ]] && break
     done
     return $ok
   }
-  for fan in "${FAN_IDS[@]}"; do
+  if [[ "$ILO_MODDED" == "1" ]]; then
+    # Modded iLO: use "fan p <id> min YY" and "fan p <id> max YY" with YY in [1..255]
+    for idx in "${!P_IDS[@]}"; do
+      local fan_id=${P_IDS[$idx]}
+      local fan=${FAN_IDS[$idx]:-fan$fan_id}
+      CURRENT=${LAST_SPEEDS[$fan]:-20}
+      DIFF=$(( target - CURRENT ))
+      if command -v jq >/dev/null 2>&1; then
+        MINC=$(jq -r '(.minChange // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
+        [[ "$MINC" =~ ^-?[0-9]+$ ]] || MINC=0
+        if (( DIFF != 0 && ${DIFF#-} < MINC )); then
+          DIFF=$(( DIFF<0 ? -MINC : MINC ))
+        fi
+      fi
+      if (( DIFF > MAX_STEP )); then DIFF=$MAX_STEP
+      elif (( DIFF < -MAX_STEP )); then DIFF=-MAX_STEP; fi
+      NEW=$(( CURRENT + DIFF ))
+      (( NEW < 0 )) && NEW=0
+      (( NEW > 100 )) && NEW=100
+      # Map percent to 1..255 (avoid 0)
+      local v255=$(( (NEW * 255 + 50) / 100 ))
+      (( v255 < 1 )) && v255=1
+      (( v255 > 255 )) && v255=255
+      # Set exact control: min = max = v255
+      if ! ssh_ilo "fan p $fan_id min $v255" >/dev/null 2>&1; then
+        echo "WARN: Failed to set fan p $fan_id min=$v255" >&2
+      fi
+      if ! ssh_ilo "fan p $fan_id max $v255" >/dev/null 2>&1; then
+        echo "WARN: Failed to set fan p $fan_id max=$v255" >&2
+      fi
+      LAST_SPEEDS[$fan]=$NEW
+    done
+  else
+    for fan in "${FAN_IDS[@]}"; do
     CURRENT=${LAST_SPEEDS[$fan]:-20}
     DIFF=$(( target - CURRENT ))
     # Optional minimum change to avoid oscillation
@@ -202,7 +296,8 @@ apply_fan_speed() {
       echo "WARN: Failed to set $fan to $NEW" >&2
     fi
     LAST_SPEEDS[$fan]=$NEW
-  done
+    done
+  fi
   # Save current speeds
   for fan in "${FAN_IDS[@]}"; do
     echo ${LAST_SPEEDS[$fan]}
