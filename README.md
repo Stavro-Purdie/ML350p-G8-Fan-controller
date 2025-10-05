@@ -53,3 +53,4 @@ Defaults are tuned for systems that idle long, then spike into heavy jobs; trim 
 - Use `ILO_SSH_LEGACY=1` for older iLO cipher support.
 - GPU telemetry requires `nvidia-smi`.
 - Self-update (pull latest Git) is now enabled by default; set `SELF_UPDATE_ENABLED=0` before launching the UI to hide it if you want to manage updates manually.
+- The updater clones from `SELF_UPDATE_CLONE_URL` (default HTTPS GitHub remote), so you don't need a configured git remote on the host—override the URL if you're mirroring the repo.

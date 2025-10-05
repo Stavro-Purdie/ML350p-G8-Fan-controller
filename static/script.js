@@ -452,18 +452,31 @@ function poll() {
         li.appendChild(meter);
         const history = fanHistory[fanId] || [];
         const trend = computeTrend(history);
+        const negligibleChange = trend.delta === 0;
+        const unpredictable = !!trend.volatile;
         const trendWrap = document.createElement('div');
         trendWrap.className = 'fan-trend';
-        const iconSpan = document.createElement('span');
-        iconSpan.className = `trend-icon ${trend.className}`;
-        iconSpan.textContent = trend.icon;
-        const labelSpan = document.createElement('span');
-        labelSpan.className = 'trend-label';
-        labelSpan.textContent = trend.label;
-        const forecastSpan = document.createElement('span');
-        forecastSpan.className = 'trend-forecast';
+  const iconSpan = document.createElement('span');
+  const labelSpan = document.createElement('span');
+  const forecastSpan = document.createElement('span');
+  labelSpan.className = 'trend-label';
+  forecastSpan.className = 'trend-forecast';
         const deltaText = trend.delta === 0 ? '' : (trend.delta > 0 ? ` (+${trend.delta}%)` : ` (${trend.delta}%)`);
-        forecastSpan.textContent = `${trendHorizonSeconds}s ≈ ${trend.forecast}%${deltaText}`;
+        let forecastText = `${trendHorizonSeconds}s ≈ ${trend.forecast}%${deltaText}`;
+        let labelText = trend.label;
+        let iconText = trend.icon;
+        let iconClass = `trend-icon ${trend.className}`;
+        if (negligibleChange || unpredictable) {
+          const message = unpredictable ? 'No fan change needed (unpredictable)' : 'No fan change needed';
+          forecastText = message;
+          labelText = 'No change needed';
+          iconText = '→';
+          iconClass = 'trend-icon trend-flat';
+        }
+  iconSpan.className = iconClass;
+  iconSpan.textContent = iconText;
+  labelSpan.textContent = labelText;
+  forecastSpan.textContent = forecastText;
         trendWrap.appendChild(iconSpan);
         trendWrap.appendChild(labelSpan);
         trendWrap.appendChild(forecastSpan);
@@ -477,7 +490,11 @@ function poll() {
         }
         const detailParts = [];
         detailParts.push(`Now ${pctWidth}%`);
-        detailParts.push(`Forecast ${trend.forecast}%`);
+        if (unpredictable) {
+          detailParts.push('Forecast unpredictable');
+        } else {
+          detailParts.push(`Forecast ${trend.forecast}%`);
+        }
         if (trend.delta !== 0) {
           detailParts.push(`Δ${trendHorizonSeconds}s ${trend.delta > 0 ? '+' : ''}${trend.delta}%`);
         }

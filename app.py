@@ -13,8 +13,11 @@ UI_CONFIG_FILE = os.getenv("UI_CONFIG_FILE", "/opt/dynamic-fan-ui/ui_config.json
 REPO_ROOT = os.getenv("REPO_ROOT", os.path.abspath(os.path.dirname(__file__)))
 # Self-update enabled by default; set SELF_UPDATE_ENABLED=0 to disable
 SELF_UPDATE_ENABLED = os.getenv("SELF_UPDATE_ENABLED", "1") == "1"
-SELF_UPDATE_REMOTE = os.getenv("SELF_UPDATE_REMOTE", "origin")
 SELF_UPDATE_BRANCH = os.getenv("SELF_UPDATE_BRANCH", "main")
+SELF_UPDATE_CLONE_URL = os.getenv(
+    "SELF_UPDATE_CLONE_URL",
+    "https://github.com/Stavro-Purdie/ML350p-G8-Fan-controller.git",
+)
 SELF_UPDATE_PRESERVE = [p.strip() for p in os.getenv("SELF_UPDATE_PRESERVE", "").split(",") if p.strip()]
 SELF_UPDATE_RESTART_CMD = os.getenv("SELF_UPDATE_RESTART_CMD", "systemctl restart dynamic-fan-ui.service")
 FAN_IDS = ["fan2", "fan3", "fan4"]
@@ -277,20 +280,20 @@ def _build_fan_categories(speeds: Optional[List[int]] = None) -> List[Dict[str, 
     return categories
 
 
-def _run_git_command(args: List[str], timeout: int = 120) -> str:
-    proc = subprocess.run(args, cwd=REPO_ROOT, capture_output=True, text=True, timeout=timeout)
+def _run_git_command(args: List[str], timeout: int = 120, cwd: Optional[str] = None) -> str:
+    proc = subprocess.run(args, cwd=cwd or REPO_ROOT, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError(f"git command failed ({' '.join(args)}): {proc.stderr.strip() or proc.stdout.strip()}")
     return proc.stdout.strip()
 
 
-def _safe_git_revision(ref: str = "HEAD", short: bool = False) -> str:
+def _safe_git_revision(ref: str = "HEAD", short: bool = False, cwd: Optional[str] = None) -> str:
     try:
         args = ["git", "rev-parse"]
         if short:
             args.append("--short")
         args.append(ref)
-        return _run_git_command(args)
+        return _run_git_command(args, cwd=cwd)
     except Exception:
         return ""
 
@@ -318,33 +321,48 @@ def _git_self_update() -> Dict[str, Any]:
     before = _safe_git_revision()
     preserve_targets: List[str] = []
     tmpdir = None
+    clone_dir: Optional[str] = None
+    backup_root: Optional[str] = None
+    clone_output = ""
+    upstream = ""
     try:
-        upstream_ref = f"{SELF_UPDATE_REMOTE}/{SELF_UPDATE_BRANCH}"
-        _run_git_command(["git", "fetch", "--prune", SELF_UPDATE_REMOTE])
-        try:
-            upstream = _safe_git_revision(upstream_ref)
-        except Exception:
-            upstream = ""
-        if upstream and upstream == before:
+        clone_url = (SELF_UPDATE_CLONE_URL or "").strip()
+        if not clone_url:
+            raise RuntimeError("Self update clone URL not configured")
+        tmpdir = tempfile.mkdtemp(prefix="selfupdate-")
+        clone_dir = os.path.join(tmpdir, "checkout")
+        clone_args = [
+            "git",
+            "clone",
+            "--depth=1",
+            "--single-branch",
+            "--branch",
+            SELF_UPDATE_BRANCH,
+            clone_url,
+            clone_dir,
+        ]
+        clone_output = _run_git_command(clone_args, cwd=tmpdir)
+        upstream = _safe_git_revision(cwd=clone_dir)
+        if before and upstream and before == upstream:
             return {
                 "before": before,
                 "after": before,
                 "upstream": upstream,
                 "changed": False,
-                "output": "Already up to date",
+                "output": clone_output or "Already up to date",
                 "preserved": [],
                 "restart": {"ran": False, "success": True, "output": "No update applied"},
             }
 
         if SELF_UPDATE_PRESERVE:
-            tmpdir = tempfile.mkdtemp(prefix="selfupdate-")
+            backup_root = os.path.join(tmpdir, "preserve")
             for rel in SELF_UPDATE_PRESERVE:
                 abs_path = os.path.abspath(os.path.join(REPO_ROOT, rel))
                 if not abs_path.startswith(REPO_ROOT):
                     continue
                 if not os.path.exists(abs_path):
                     continue
-                backup_path = os.path.abspath(os.path.join(tmpdir, rel))
+                backup_path = os.path.abspath(os.path.join(backup_root, rel))
                 backup_dir = os.path.dirname(backup_path)
                 if backup_dir:
                     os.makedirs(backup_dir, exist_ok=True)
@@ -354,36 +372,59 @@ def _git_self_update() -> Dict[str, Any]:
                     shutil.copy2(abs_path, backup_path)
                 preserve_targets.append(rel)
 
-        pull_output = _run_git_command(["git", "pull", "--ff-only", SELF_UPDATE_REMOTE, SELF_UPDATE_BRANCH])
-        after = _safe_git_revision()
-        changed = before != after
+        # Replace working tree with freshly cloned checkout
+        for entry in os.listdir(REPO_ROOT):
+            path = os.path.join(REPO_ROOT, entry)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    continue
 
-        if preserve_targets and tmpdir:
+        if not clone_dir or not os.path.isdir(clone_dir):
+            raise RuntimeError("Clone directory missing after git clone")
+
+        for entry in os.listdir(clone_dir):
+            src_path = os.path.join(clone_dir, entry)
+            dest_path = os.path.join(REPO_ROOT, entry)
+            if os.path.isdir(src_path):
+                shutil.copytree(src_path, dest_path, dirs_exist_ok=True)
+            else:
+                dest_parent = os.path.dirname(dest_path)
+                if dest_parent:
+                    os.makedirs(dest_parent, exist_ok=True)
+                shutil.copy2(src_path, dest_path)
+
+        if preserve_targets and backup_root:
             for rel in preserve_targets:
-                backup_path = os.path.join(tmpdir, rel)
-                abs_path = os.path.abspath(os.path.join(REPO_ROOT, rel))
-                target_dir = os.path.dirname(abs_path)
-                if target_dir:
-                    os.makedirs(target_dir, exist_ok=True)
+                backup_path = os.path.join(backup_root, rel)
+                dest_path = os.path.abspath(os.path.join(REPO_ROOT, rel))
+                dest_dir = os.path.dirname(dest_path)
+                if dest_dir:
+                    os.makedirs(dest_dir, exist_ok=True)
                 if os.path.isdir(backup_path):
-                    if os.path.exists(abs_path):
-                        shutil.rmtree(abs_path)
-                    shutil.copytree(backup_path, abs_path, dirs_exist_ok=True)
+                    if os.path.exists(dest_path):
+                        shutil.rmtree(dest_path)
+                    shutil.copytree(backup_path, dest_path, dirs_exist_ok=True)
                 elif os.path.exists(backup_path):
-                    shutil.copy2(backup_path, abs_path)
+                    shutil.copy2(backup_path, dest_path)
 
+        after = _safe_git_revision(cwd=REPO_ROOT) or upstream
+        changed = True if not before else before != after
         restart_info = _restart_service_if_needed(changed)
+        output_msg = clone_output or f"Updated from {clone_url}"
         return {
             "before": before,
             "after": after,
             "upstream": upstream,
             "changed": changed,
-            "output": pull_output,
+            "output": output_msg,
             "preserved": preserve_targets,
             "restart": restart_info,
         }
     except Exception:
-        # Attempt to restore repository state upon failure
         try:
             if before:
                 _run_git_command(["git", "reset", "--hard", before])
