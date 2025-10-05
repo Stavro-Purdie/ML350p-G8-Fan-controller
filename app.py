@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, redirect, jsonify
-import json, os, subprocess, re, time, threading, shutil
+import json, os, subprocess, re, time, threading, shutil, tempfile, shlex
 from collections import deque
 from typing import Optional, List, Tuple, Dict, Any
 
@@ -10,6 +10,13 @@ FAN_CURVE_FILE = os.getenv("FAN_CURVE_FILE", "/opt/dynamic-fan-ui/fan_curve.json
 FAN_SPEED_FILE = os.getenv("FAN_SPEED_FILE", "/opt/dynamic-fan-ui/fan_speeds.txt")
 FAN_SPEED_BITS_FILE = os.getenv("FAN_SPEED_BITS_FILE", "/opt/dynamic-fan-ui/fan_speeds_bits.txt")
 UI_CONFIG_FILE = os.getenv("UI_CONFIG_FILE", "/opt/dynamic-fan-ui/ui_config.json")
+REPO_ROOT = os.getenv("REPO_ROOT", os.path.abspath(os.path.dirname(__file__)))
+# Self-update intentionally disabled by default; enable with SELF_UPDATE_ENABLED=1
+SELF_UPDATE_ENABLED = os.getenv("SELF_UPDATE_ENABLED", "0") == "1"
+SELF_UPDATE_REMOTE = os.getenv("SELF_UPDATE_REMOTE", "origin")
+SELF_UPDATE_BRANCH = os.getenv("SELF_UPDATE_BRANCH", "main")
+SELF_UPDATE_PRESERVE = [p.strip() for p in os.getenv("SELF_UPDATE_PRESERVE", "").split(",") if p.strip()]
+SELF_UPDATE_RESTART_CMD = os.getenv("SELF_UPDATE_RESTART_CMD", "systemctl restart dynamic-fan-ui.service")
 FAN_IDS = ["fan2", "fan3", "fan4"]
 # Allow override via env string: FAN_IDS_STR="fan2 fan3 fan4"
 _ids_env = os.getenv("FAN_IDS_STR", "").strip()
@@ -234,6 +241,124 @@ def _build_fan_categories(speeds: Optional[List[int]] = None) -> List[Dict[str, 
                 item["speed"] = speeds[idx]
         cat["items"].append(item)
     return categories
+
+
+def _run_git_command(args: List[str], timeout: int = 120) -> str:
+    proc = subprocess.run(args, cwd=REPO_ROOT, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(f"git command failed ({' '.join(args)}): {proc.stderr.strip() or proc.stdout.strip()}")
+    return proc.stdout.strip()
+
+
+def _safe_git_revision(ref: str = "HEAD", short: bool = False) -> str:
+    try:
+        args = ["git", "rev-parse"]
+        if short:
+            args.append("--short")
+        args.append(ref)
+        return _run_git_command(args)
+    except Exception:
+        return ""
+
+
+def _restart_service_if_needed(changed: bool) -> Dict[str, Any]:
+    if not changed:
+        return {"ran": False, "success": True, "output": "No update applied"}
+    cmd = (SELF_UPDATE_RESTART_CMD or "").strip()
+    if not cmd:
+        return {"ran": False, "success": True, "output": "Restart command disabled"}
+    try:
+        proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=180)
+    except FileNotFoundError as e:
+        raise RuntimeError(f"Restart command not found: {e}")
+    if proc.returncode != 0:
+        raise RuntimeError(f"Restart failed: {proc.stderr.strip() or proc.stdout.strip() or 'unknown error'}")
+    return {"ran": True, "success": True, "output": proc.stdout.strip() or "Service restarted"}
+
+
+def _git_self_update() -> Dict[str, Any]:
+    if not SELF_UPDATE_ENABLED:
+        raise PermissionError("Self update is disabled")
+    if not os.path.isdir(REPO_ROOT):
+        raise RuntimeError(f"Repository root {REPO_ROOT} not accessible")
+    before = _safe_git_revision()
+    preserve_targets: List[str] = []
+    tmpdir = None
+    try:
+        upstream_ref = f"{SELF_UPDATE_REMOTE}/{SELF_UPDATE_BRANCH}"
+        _run_git_command(["git", "fetch", "--prune", SELF_UPDATE_REMOTE])
+        try:
+            upstream = _safe_git_revision(upstream_ref)
+        except Exception:
+            upstream = ""
+        if upstream and upstream == before:
+            return {
+                "before": before,
+                "after": before,
+                "upstream": upstream,
+                "changed": False,
+                "output": "Already up to date",
+                "preserved": [],
+                "restart": {"ran": False, "success": True, "output": "No update applied"},
+            }
+
+        if SELF_UPDATE_PRESERVE:
+            tmpdir = tempfile.mkdtemp(prefix="selfupdate-")
+            for rel in SELF_UPDATE_PRESERVE:
+                abs_path = os.path.abspath(os.path.join(REPO_ROOT, rel))
+                if not abs_path.startswith(REPO_ROOT):
+                    continue
+                if not os.path.exists(abs_path):
+                    continue
+                backup_path = os.path.abspath(os.path.join(tmpdir, rel))
+                backup_dir = os.path.dirname(backup_path)
+                if backup_dir:
+                    os.makedirs(backup_dir, exist_ok=True)
+                if os.path.isdir(abs_path):
+                    shutil.copytree(abs_path, backup_path, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(abs_path, backup_path)
+                preserve_targets.append(rel)
+
+        pull_output = _run_git_command(["git", "pull", "--ff-only", SELF_UPDATE_REMOTE, SELF_UPDATE_BRANCH])
+        after = _safe_git_revision()
+        changed = before != after
+
+        if preserve_targets and tmpdir:
+            for rel in preserve_targets:
+                backup_path = os.path.join(tmpdir, rel)
+                abs_path = os.path.abspath(os.path.join(REPO_ROOT, rel))
+                target_dir = os.path.dirname(abs_path)
+                if target_dir:
+                    os.makedirs(target_dir, exist_ok=True)
+                if os.path.isdir(backup_path):
+                    if os.path.exists(abs_path):
+                        shutil.rmtree(abs_path)
+                    shutil.copytree(backup_path, abs_path, dirs_exist_ok=True)
+                elif os.path.exists(backup_path):
+                    shutil.copy2(backup_path, abs_path)
+
+        restart_info = _restart_service_if_needed(changed)
+        return {
+            "before": before,
+            "after": after,
+            "upstream": upstream,
+            "changed": changed,
+            "output": pull_output,
+            "preserved": preserve_targets,
+            "restart": restart_info,
+        }
+    except Exception:
+        # Attempt to restore repository state upon failure
+        try:
+            if before:
+                _run_git_command(["git", "reset", "--hard", before])
+        except Exception:
+            pass
+        raise
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _build_ssh_base():
@@ -957,6 +1082,8 @@ def index():
         "ILO_BATCH_SIZE": ILO_BATCH_SIZE,
         "PWM_UNITS": PWM_UNITS,
         "configured_fans": FAN_IDS,
+        "SELF_UPDATE_ENABLED": 1 if SELF_UPDATE_ENABLED else 0,
+        "SELF_UPDATE_PRESERVE": SELF_UPDATE_PRESERVE,
     }
     return render_template(
         "index.html",
@@ -1057,6 +1184,23 @@ def status():
         "sensors": sensors, "gpu_info": gpu_info,
         "service": svc, "ok": True,
     })
+
+
+@app.route("/self_update", methods=["POST"])
+def self_update():
+    if not SELF_UPDATE_ENABLED:
+        return jsonify({"ok": False, "error": "Self-update is disabled"}), 403
+    try:
+        result = _git_self_update()
+        return jsonify({"ok": True, **result})
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "Timed out while updating"}), 504
+    except PermissionError as e:
+        return jsonify({"ok": False, "error": str(e)}), 403
+    except RuntimeError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 def _pct_to_bits(p: int) -> int:

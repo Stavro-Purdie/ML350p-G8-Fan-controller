@@ -2,6 +2,150 @@
 let tempChart, fanChart;
 let fanSeriesInit = false;
 const maxPoints = 120; // ~10 minutes at 5s
+const fanHistory = {};
+const fanHistoryLimit = 24; // ~2 minutes of samples at 5s
+const trendHorizonSeconds = 30;
+let updateInProgress = false;
+
+const setUpdateInProgress = (state) => {
+  updateInProgress = state;
+  const targets = document.querySelectorAll('[data-disable-during-update]');
+  targets.forEach(target => {
+    if (state) {
+      target.classList.add('update-disabled');
+    } else {
+      target.classList.remove('update-disabled');
+    }
+    const controls = target.matches('button, input, select, textarea, fieldset')
+      ? [target]
+      : target.querySelectorAll('button, input, select, textarea, fieldset');
+    controls.forEach(ctrl => {
+      if (state) {
+        if (!ctrl.dataset.disabledDuringUpdate) {
+          ctrl.dataset.disabledDuringUpdate = '1';
+          if (ctrl.disabled) {
+            ctrl.dataset.disabledBeforeUpdate = '1';
+          }
+          ctrl.disabled = true;
+        }
+      } else if (ctrl.dataset.disabledDuringUpdate) {
+        delete ctrl.dataset.disabledDuringUpdate;
+        if (ctrl.dataset.disabledBeforeUpdate) {
+          delete ctrl.dataset.disabledBeforeUpdate;
+        } else {
+          ctrl.disabled = false;
+        }
+      }
+    });
+  });
+  const overlay = document.getElementById('updateOverlay');
+  if (overlay) {
+    overlay.setAttribute('aria-hidden', String(!state));
+    overlay.classList.toggle('visible', state);
+  }
+  document.body.classList.toggle('update-in-progress', state);
+};
+
+const ensureHistory = (key) => {
+  if (!fanHistory[key]) fanHistory[key] = [];
+  return fanHistory[key];
+};
+
+const computeTrend = (points, horizonSeconds = trendHorizonSeconds) => {
+  const fallback = () => {
+    const last = points && points.length ? points[points.length - 1].value : 0;
+    return { forecast: Math.round(last), delta: 0, label: 'Stable', icon: '→', className: 'trend-flat', volatile: false };
+  };
+  if (!points || points.length < 3) return fallback();
+  const base = points[0].t;
+  let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+  let signFlips = 0;
+  let lastDiffSign = 0;
+  let maxJump = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    const diff = points[i].value - points[i - 1].value;
+    maxJump = Math.max(maxJump, Math.abs(diff));
+    const sign = diff === 0 ? 0 : (diff > 0 ? 1 : -1);
+    if (sign !== 0 && lastDiffSign !== 0 && sign !== lastDiffSign) {
+      signFlips += 1;
+    }
+    if (sign !== 0) lastDiffSign = sign;
+  }
+  for (const p of points) {
+    const x = (p.t - base) / 1000;
+    const y = p.value;
+    sumX += x;
+    sumY += y;
+    sumXY += x * y;
+    sumXX += x * x;
+  }
+  const n = points.length;
+  const denom = n * sumXX - sumX * sumX;
+  if (Math.abs(denom) < 1e-6) return fallback();
+  const slope = (n * sumXY - sumX * sumY) / denom;
+  const meanX = sumX / n;
+  const meanY = sumY / n;
+  const intercept = meanY - slope * meanX;
+  const lastX = (points[n - 1].t - base) / 1000;
+  const current = points[n - 1].value;
+  let effectiveHorizon = horizonSeconds;
+  const recentDiff = points[n - 1].value - points[n - 2].value;
+  const velocity = slope;
+  const volatility = signFlips >= 2 || maxJump >= 30 || Math.abs(recentDiff) >= 25;
+  if (volatility) {
+    effectiveHorizon = Math.max(5, Math.min(15, horizonSeconds / 2));
+  } else if (Math.abs(velocity) > 2.5) {
+    effectiveHorizon = Math.min(horizonSeconds, 20);
+  }
+  let forecast = intercept + slope * (lastX + effectiveHorizon);
+  if (!Number.isFinite(forecast)) return fallback();
+  forecast = Math.max(0, Math.min(100, forecast));
+  let delta = forecast - current;
+  const absDelta = Math.abs(delta);
+  let label = 'Stable';
+  let icon = '→';
+  let className = 'trend-flat';
+  let roundDelta = Math.round(delta);
+  if (absDelta < 1.2) {
+    delta = 0;
+    roundDelta = 0;
+    forecast = current;
+  } else if (delta >= 6) {
+    label = 'Spiking';
+    icon = '⤴';
+    className = 'trend-spike';
+  } else if (delta >= 2) {
+    label = 'Rising';
+    icon = '↑';
+    className = 'trend-up';
+  } else if (delta <= -6) {
+    label = 'Plunging';
+    icon = '⤵';
+    className = 'trend-plunge';
+  } else if (delta <= -2) {
+    label = 'Falling';
+    icon = '↓';
+    className = 'trend-down';
+  }
+  if (volatility) {
+    label = 'Volatile';
+    icon = '≈';
+    className = 'trend-volatile';
+    const damped = Math.max(-10, Math.min(10, delta));
+    delta = damped;
+    forecast = current + damped;
+    roundDelta = Math.round(delta);
+  }
+  const finalForecast = Math.round(Math.max(0, Math.min(100, forecast)));
+  return {
+    forecast: finalForecast,
+    delta: roundDelta,
+    label,
+    icon,
+    className,
+    volatile: volatility
+  };
+};
 
 function initCharts() {
   if (typeof Chart === 'undefined') return;
@@ -41,6 +185,21 @@ function poll() {
       const labels = Array.isArray(data.fan_labels) ? data.fan_labels : [];
       const groups = Array.isArray(data.fan_groups) ? data.fan_groups : [];
       const categories = Array.isArray(data.fan_categories) ? data.fan_categories : null;
+      const rawFans = Array.isArray(data.fans) ? data.fans : [];
+      const speeds = rawFans.map(v => {
+        const num = parseInt(v, 10);
+        if (Number.isNaN(num)) return 0;
+        return Math.max(0, Math.min(100, num));
+      });
+      const nowTs = Date.now();
+      speeds.forEach((value, idx) => {
+        const key = ids[idx] || `fan${idx + 1}`;
+        const history = ensureHistory(key);
+        history.push({ t: nowTs, value });
+        if (history.length > fanHistoryLimit) {
+          history.splice(0, history.length - fanHistoryLimit);
+        }
+      });
       const cpu = parseInt(data.cpu || '0', 10) || 0;
       const gpu = parseInt(data.gpu || '0', 10) || 0;
       document.getElementById('cpu').innerText = data.cpu;
@@ -50,7 +209,7 @@ function poll() {
       const health = document.getElementById('health');
       if (health && data.ok) {
         health.style.display = 'block';
-        const summary = data.fans.map((val, idx) => {
+        const summary = speeds.map((val, idx) => {
           const name = labels[idx] || ids[idx] || `Fan ${idx + 1}`;
           const group = groups[idx] ? `${groups[idx]} ` : '';
           return `${group}${name} ${val}%`;
@@ -61,8 +220,15 @@ function poll() {
       fanList.innerHTML = '';
       const ilo = data.ilo_fan_percents || {};
       const bits = data.fan_bits || [];
+      const pickHeatClass = (pct) => {
+        if (pct >= 90) return { bar: 'bar-hot', item: 'fan-hot' };
+        if (pct >= 70) return { bar: 'bar-warm', item: 'fan-warm' };
+        if (pct >= 45) return { bar: 'bar-cool', item: 'fan-cool' };
+        return { bar: 'bar-chill', item: 'fan-chill' };
+      };
+
       const buildFanRow = (idx, options = {}) => {
-        if (idx == null || idx < 0 || idx >= data.fans.length) {
+        if (idx == null || idx < 0 || idx >= speeds.length) {
           return null;
         }
         const { showGroup = true, overrideSpeed } = options;
@@ -73,30 +239,101 @@ function poll() {
         const group = groups[idx] || '';
         const header = document.createElement('div');
         header.className = 'fan-header';
-        const prefix = showGroup && group ? `${group} • ` : '';
-        header.textContent = `${prefix}${label} (${fanId})`;
-        li.appendChild(header);
-        const meter = document.createElement('div');
-        meter.className = 'meter';
-        const bar = document.createElement('div');
-        bar.className = 'bar';
-        let displayValue = data.fans[idx];
+        const labelWrap = document.createElement('div');
+        labelWrap.className = 'fan-label';
+        if (showGroup && group) {
+          const badge = document.createElement('span');
+          badge.className = 'fan-badge';
+          badge.textContent = group;
+          labelWrap.appendChild(badge);
+        }
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'fan-name';
+        nameSpan.textContent = label;
+        labelWrap.appendChild(nameSpan);
+        const idSpan = document.createElement('span');
+        idSpan.className = 'fan-id';
+        idSpan.textContent = fanId;
+        labelWrap.appendChild(idSpan);
+        header.appendChild(labelWrap);
+        const valueSpan = document.createElement('div');
+        valueSpan.className = 'fan-value';
+        let displayValue = speeds[idx];
         if (displayValue === undefined || displayValue === null || displayValue === '') {
           displayValue = overrideSpeed ?? 0;
         }
         const pctNum = parseInt(displayValue, 10);
         const pctWidth = Number.isNaN(pctNum) ? 0 : Math.max(0, Math.min(100, pctNum));
+        valueSpan.textContent = `${pctWidth}%`;
+        header.appendChild(valueSpan);
+        li.appendChild(header);
+        li.dataset.percent = pctWidth;
+        const heatClass = pickHeatClass(pctWidth);
+        li.classList.add(heatClass.item);
+        const meter = document.createElement('div');
+        meter.className = 'meter';
+        meter.setAttribute('role', 'progressbar');
+        meter.setAttribute('aria-valuemin', '0');
+        meter.setAttribute('aria-valuemax', '100');
+        meter.setAttribute('aria-valuenow', pctWidth);
+        const bar = document.createElement('div');
+        bar.className = `bar ${heatClass.bar}`;
         bar.style.width = `${pctWidth}%`;
+        bar.style.setProperty('--initial-width', `${pctWidth}%`);
+        bar.dataset.percent = pctWidth;
         meter.appendChild(bar);
         li.appendChild(meter);
+        const history = fanHistory[fanId] || [];
+        const trend = computeTrend(history);
+        const trendWrap = document.createElement('div');
+        trendWrap.className = 'fan-trend';
+        const iconSpan = document.createElement('span');
+        iconSpan.className = `trend-icon ${trend.className}`;
+        iconSpan.textContent = trend.icon;
+        const labelSpan = document.createElement('span');
+        labelSpan.className = 'trend-label';
+        labelSpan.textContent = trend.label;
+        const forecastSpan = document.createElement('span');
+        forecastSpan.className = 'trend-forecast';
+        const deltaText = trend.delta === 0 ? '' : (trend.delta > 0 ? ` (+${trend.delta}%)` : ` (${trend.delta}%)`);
+        forecastSpan.textContent = `${trendHorizonSeconds}s ≈ ${trend.forecast}%${deltaText}`;
+        trendWrap.appendChild(iconSpan);
+        trendWrap.appendChild(labelSpan);
+        trendWrap.appendChild(forecastSpan);
+        li.appendChild(trendWrap);
+        li.dataset.forecast = trend.forecast;
+        li.dataset.trend = trend.className.replace('trend-', '');
+        if (trend.volatile) {
+          li.dataset.volatility = 'high';
+        } else {
+          delete li.dataset.volatility;
+        }
+        const detailParts = [];
+        detailParts.push(`Now ${pctWidth}%`);
+        detailParts.push(`Forecast ${trend.forecast}%`);
+        if (trend.delta !== 0) {
+          detailParts.push(`Δ${trendHorizonSeconds}s ${trend.delta > 0 ? '+' : ''}${trend.delta}%`);
+        }
         const raw = bits[idx] ?? '';
-        const iloPct = (ilo && Object.prototype.hasOwnProperty.call(ilo, fanId)) ? ` | iLO ${ilo[fanId]}%` : '';
+        if (raw !== undefined && raw !== null && raw !== '') {
+          detailParts.push(`raw ${raw}/255`);
+        }
+        if (ilo && Object.prototype.hasOwnProperty.call(ilo, fanId)) {
+          detailParts.push(`iLO ${ilo[fanId]}%`);
+        }
         const detail = document.createElement('div');
         detail.className = 'fan-detail';
-        detail.textContent = `${displayValue}% (raw ${raw || ''}/255)${iloPct}`;
+        detail.textContent = detailParts.join(' • ');
         li.appendChild(detail);
+        const shouldStrobe = pctWidth >= 92 || trend.forecast >= 95 || Math.abs(trend.delta) >= 12 || trend.volatile;
+        if (shouldStrobe) {
+          li.classList.add('strobe-active');
+        } else {
+          li.classList.remove('strobe-active');
+        }
         return li;
       };
+
       let appended = false;
       if (categories && categories.length) {
         categories.forEach(cat => {
@@ -124,7 +361,7 @@ function poll() {
         });
       }
       if (!appended) {
-        data.fans.forEach((_, i) => {
+        speeds.forEach((_, i) => {
           const row = buildFanRow(i, { showGroup: true });
           if (row) fanList.appendChild(row);
         });
@@ -167,18 +404,18 @@ function poll() {
         // Initialize fan series to match fan count once
         if (!fanSeriesInit) {
           const colors = ['#2ecc71','#1abc9c','#9b59b6','#f1c40f','#e67e22','#34495e','#16a085','#8e44ad'];
-          fanChart.data.datasets = data.fans.map((_, i) => ({
+          fanChart.data.datasets = speeds.map((_, i) => ({
             label: labels[i] || ids[i] || `Fan ${i+1}`, data: [], borderColor: colors[i % colors.length], fill: false
           }));
           fanSeriesInit = true;
         }
-        if (fanChart.data.datasets.length === data.fans.length) {
+        if (fanChart.data.datasets.length === speeds.length) {
           fanChart.data.datasets.forEach((ds, idx) => {
             const lbl = labels[idx] || ids[idx] || ds.label;
             if (lbl && ds.label !== lbl) ds.label = lbl;
           });
         }
-        const fans = data.fans.map(v => v ?? null);
+        const fans = speeds.map(v => v ?? null);
         pushData(fanChart, fans);
         // Persist last few points to localStorage (lightweight)
         try {
@@ -269,4 +506,65 @@ function loadLogs() {
     if (!pre) return;
     if (obj.ok) pre.textContent = obj.text || ''; else pre.textContent = obj.error || 'Error fetching logs';
   }).catch(() => {});
+}
+
+function triggerSelfUpdate() {
+  const statusEl = document.getElementById('selfUpdateStatus');
+  const btn = document.getElementById('selfUpdateButton');
+  if (btn) btn.disabled = true;
+  setUpdateInProgress(true);
+  if (statusEl) {
+    statusEl.textContent = 'Checking for updates…';
+    statusEl.className = 'status-text pending';
+  }
+  const shortCommit = (rev) => (rev && typeof rev === 'string') ? rev.substring(0, 8) : 'unknown';
+  fetch('/self_update', { method: 'POST' })
+    .then(async res => {
+      let payload = {};
+      try {
+        payload = await res.json();
+      } catch (_) {
+        payload = {};
+      }
+      if (!res.ok || !payload.ok) {
+        const msg = payload.error || `HTTP ${res.status}`;
+        if (statusEl) {
+          statusEl.textContent = `Update failed: ${msg}`;
+          statusEl.className = 'status-text error';
+        }
+        return;
+      }
+      const before = shortCommit(payload.before);
+      const after = shortCommit(payload.after);
+      const changed = !!payload.changed;
+      const summary = changed ? `${before} → ${after}` : `${after} (up-to-date)`;
+      const info = (payload.output || '').split('\n').map(s => s.trim()).filter(Boolean).slice(-2).join(' | ');
+      const preserved = Array.isArray(payload.preserved) ? payload.preserved.filter(Boolean) : [];
+      const restart = payload.restart || {};
+      if (statusEl) {
+        const parts = [];
+        parts.push(changed ? `Update complete: ${summary}` : `Already up to date: ${summary}`);
+        if (info) parts.push(info);
+        if (preserved.length) parts.push(`Preserved ${preserved.join(', ')}`);
+        if (restart && restart.ran) {
+          parts.push(restart.output ? `Restarted (${restart.output})` : 'Restarted service');
+        } else if (restart && restart.output && changed) {
+          parts.push(restart.output);
+        }
+        statusEl.textContent = parts.join(' • ');
+        statusEl.className = 'status-text success';
+      }
+    })
+    .catch(() => {
+      if (statusEl) {
+        statusEl.textContent = 'Update failed: network error';
+        statusEl.className = 'status-text error';
+      }
+    })
+    .finally(() => {
+      setUpdateInProgress(false);
+      setTimeout(() => {
+        if (btn) btn.disabled = false;
+      }, 400);
+    });
 }

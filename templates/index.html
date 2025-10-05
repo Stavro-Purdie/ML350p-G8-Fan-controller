@@ -10,6 +10,7 @@
   <link rel="icon" href="data:,">
 </head>
 <body>
+  <div id="updateOverlay" class="update-overlay" aria-hidden="true">Update in progress…</div>
   <h1>HP ML350p Gen8 Fan Dashboard</h1>
 
   <div>
@@ -19,30 +20,66 @@
 
   <h2>Fan Speeds</h2>
   <ul id="fan-speeds" class="meters">
-    {% if fan_categories %}
-      {% for category in fan_categories %}
         <li class="fan-category">
           <div class="fan-category-title">{{ category.name }}</div>
           <ul class="fan-category-items">
             {% for item in category['items'] %}
               {% set idx = item.index if item.index is defined else loop.index0 %}
               {% set label = item.label if item.label is defined else (fan_labels[idx] if fan_labels and fan_labels|length > idx else 'Fan ' ~ (idx + 1)) %}
-              {% set speed = item.speed if item.speed is defined else (fan_speeds[idx] if fan_speeds and fan_speeds|length > idx else '') %}
-              <li class="fan-item">
-                <strong>{{ label }}</strong>
-                {% if speed %}<span class="fan-speed">{{ speed }}%</span>{% endif %}
+              {% set speed = item.speed if item.speed is defined else (fan_speeds[idx] if fan_speeds and fan_speeds|length > idx else 0) %}
+              {% set fan_id = item.id if item.id is defined else ('fan' ~ (idx + 1)) %}
+              <li class="fan-item fan-chill" data-percent="{{ speed }}" data-forecast="{{ speed }}" data-trend="flat">
+                <div class="fan-header">
+                  <div class="fan-label">
+                    <span class="fan-name">{{ label }}</span>
+                    <span class="fan-id">{{ fan_id }}</span>
+                  </div>
+                  <div class="fan-value">{{ speed }}%</div>
+                </div>
+                <div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ speed }}">
+                  <div class="bar bar-chill" style="--initial-width: {{ speed }}%;"></div>
+                </div>
+                <div class="fan-trend">
+                  <span class="trend-icon trend-flat">→</span>
+                  <span class="trend-label">Stable</span>
+                  <span class="trend-forecast">30s ≈ {{ speed }}%</span>
+                </div>
+                <div class="fan-detail">Now {{ speed }}%</div>
               </li>
             {% endfor %}
+          </ul>
+        </li>
           </ul>
         </li>
       {% endfor %}
     {% else %}
       {% for s in fan_speeds %}
         {% set idx = loop.index0 %}
-        {% set label = fan_labels[idx] if fan_labels and fan_labels|length > idx else 'Fan ' ~ (idx + 1) %}
+        <li class="fan-item fan-chill" data-percent="{{ s }}" data-forecast="{{ s }}" data-trend="flat">
         {% set group = fan_groups[idx] if fan_groups and fan_groups|length > idx else '' %}
-        <li>
-          {% if group %}<strong>{{ group }}</strong> • {% endif %}{{ label }}: {{ s }}%
+        <li class="fan-item" data-percent="{{ s }}" data-forecast="{{ s }}" data-trend="flat">
+          <div class="fan-header">
+            <div class="fan-label">
+              {% if group %}<span class="fan-badge">{{ group }}</span>{% endif %}
+              <span class="fan-name">{{ label }}</span>
+              <span class="fan-id">fan{{ idx + 1 }}</span>
+            </div>
+            <div class="fan-value">{{ s }}%</div>
+            <div class="bar bar-chill" style="--initial-width: {{ s }}%;"></div>
+          <div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ s }}">
+          <div class="fan-trend">
+            <span class="trend-icon trend-flat">→</span>
+            <span class="trend-label">Stable</span>
+            <span class="trend-forecast">30s ≈ {{ s }}%</span>
+          </div>
+            <div class="bar" style="width: {{ s }}%;"></div>
+          </div>
+          <div class="fan-trend">
+            <span class="trend-icon trend-flat">→</span>
+            <span class="trend-label">Stable</span>
+            <span class="trend-forecast">30s ≈ {{ s }}%</span>
+          </div>
+          <div class="fan-detail">Initial target {{ s }}%</div>
         </li>
       {% endfor %}
     {% endif %}
@@ -53,7 +90,7 @@
   <div id="queueInfo" style="padding:8px; background:#efe; border:1px solid #cfc; margin:10px 0; display:none;"></div>
 
   <h2>Fan Curve</h2>
-  <form method="post" action="/update_curve">
+  <form method="post" action="/update_curve" data-disable-during-update>
     <label>Min Temp: <input type="number" name="minTemp" value="{{ fan_curve.minTemp }}"> °C</label>
     <label>Max Temp: <input type="number" name="maxTemp" value="{{ fan_curve.maxTemp }}"> °C</label>
     <label>Min Speed: <input type="number" name="minSpeed" value="{{ fan_curve.minSpeed }}"> %</label>
@@ -91,13 +128,26 @@
   </form>
 
   <h2>Service Control</h2>
-  <form method="post" action="/control">
+  <form method="post" action="/control" data-disable-during-update>
     <button name="action" value="start">Start</button>
     <button name="action" value="stop">Stop</button>
   </form>
 
+  <h2>Self Update</h2>
+  {% if settings.SELF_UPDATE_ENABLED %}
+    <div class="self-update-panel">
+      <button type="button" id="selfUpdateButton" onclick="triggerSelfUpdate()">Pull latest from Git</button>
+      <div id="selfUpdateStatus" class="status-text">Self-update ready</div>
+    </div>
+    {% if settings.SELF_UPDATE_PRESERVE %}
+      <div class="status-text muted">Preserving: {{ settings.SELF_UPDATE_PRESERVE | join(', ') }}</div>
+    {% endif %}
+  {% else %}
+    <p class="status-text muted">Self-update disabled. Set <code>SELF_UPDATE_ENABLED=1</code> and reload to enable.</p>
+  {% endif %}
+
   <h3>Fan Test</h3>
-  <form method="post" action="/fan_test" style="margin-top:8px;">
+  <form method="post" action="/fan_test" style="margin-top:8px;" data-disable-during-update>
     Percent: <input type="number" name="test_percent" min="0" max="100" value="100" style="width:70px;"> %
     Duration: <input type="number" name="test_duration" min="1" max="60" value="10" style="width:70px;"> s
     <button type="submit">Run Test</button>
@@ -116,7 +166,7 @@
   </p>
 
   <h2>iLO Control Settings</h2>
-  <form method="post" action="/settings" style="display:grid; grid-template-columns: repeat(3, minmax(200px, 1fr)); gap:8px; align-items:center;">
+  <form method="post" action="/settings" style="display:grid; grid-template-columns: repeat(3, minmax(200px, 1fr)); gap:8px; align-items:center;" data-disable-during-update>
     <label>Legacy SSH
       <select name="ILO_SSH_LEGACY"><option value="0" {% if not settings.ILO_SSH_LEGACY %}selected{% endif %}>No</option><option value="1" {% if settings.ILO_SSH_LEGACY %}selected{% endif %}>Yes</option></select>
     </label>
@@ -171,11 +221,11 @@
   </form>
 
   <h2>Recent iLO Commands (server)</h2>
-  <button onclick="loadILORecent()">Refresh</button>
+  <button onclick="loadILORecent()" data-disable-during-update>Refresh</button>
   <pre id="iloRecent" style="white-space:pre-wrap; background:#111; color:#0f0; padding:8px; max-height:240px; overflow:auto;"></pre>
 
   <h2>Daemon Logs (last 80 lines)</h2>
-  <button onclick="loadLogs()">Refresh</button>
+  <button onclick="loadLogs()" data-disable-during-update>Refresh</button>
   <pre id="logs" style="white-space:pre-wrap; background:#222; color:#ddd; padding:8px; max-height:300px; overflow:auto;"></pre>
 
   <h2>Other Sensors</h2>
