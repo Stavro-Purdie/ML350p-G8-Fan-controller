@@ -19,7 +19,33 @@
 
   <h2>Fan Speeds</h2>
   <ul id="fan-speeds" class="meters">
-    {% for s in fan_speeds %}<li>{{ s }}%</li>{% endfor %}
+    {% if fan_categories %}
+      {% for category in fan_categories %}
+        <li class="fan-category">
+          <div class="fan-category-title">{{ category.name }}</div>
+          <ul class="fan-category-items">
+            {% for item in category.items %}
+              {% set idx = item.index if item.index is defined else loop.index0 %}
+              {% set label = item.label if item.label is defined else (fan_labels[idx] if fan_labels and fan_labels|length > idx else 'Fan ' ~ (idx + 1)) %}
+              {% set speed = item.speed if item.speed is defined else (fan_speeds[idx] if fan_speeds and fan_speeds|length > idx else '') %}
+              <li class="fan-item">
+                <strong>{{ label }}</strong>
+                {% if speed %}<span class="fan-speed">{{ speed }}%</span>{% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        </li>
+      {% endfor %}
+    {% else %}
+      {% for s in fan_speeds %}
+        {% set idx = loop.index0 %}
+        {% set label = fan_labels[idx] if fan_labels and fan_labels|length > idx else 'Fan ' ~ (idx + 1) %}
+        {% set group = fan_groups[idx] if fan_groups and fan_groups|length > idx else '' %}
+        <li>
+          {% if group %}<strong>{{ group }}</strong> • {% endif %}{{ label }}: {{ s }}%
+        </li>
+      {% endfor %}
+    {% endif %}
   </ul>
 
   <div id="health" style="padding:8px; background:#eef; border:1px solid #ccd; margin:10px 0; display:none;"></div>

@@ -141,6 +141,7 @@ fi
 if [[ "$ILO_SSH_TTY" == "1" || "$ILO_MODDED" == "1" ]]; then
   SSH_OPTS+=("-tt")
 fi
+
 ssh_ilo() {
   local cmd=$1
   [[ "$VERBOSE" == "1" ]] && echo "[ssh_ilo] CMD: $cmd" >&2
@@ -534,95 +535,120 @@ while true; do
   [[ "$CPU_TEMP" =~ ^[0-9]+$ ]] || CPU_TEMP=0
   [[ "$GPU_TEMP" =~ ^[0-9]+$ ]] || GPU_TEMP=0
   read CPU_TARGET GPU_TARGET < <(calc_targets "$CPU_TEMP" "$GPU_TEMP")
-  # Blend mode and GPU boost
-  BLEND_MODE=$(jq -r '(.blend.mode // "max")' "$FAN_CURVE_FILE" 2>/dev/null || echo max)
-  if [[ "$BLEND_MODE" == "weighted" ]]; then
-    CW=$(jq -r '(.blend.cpuWeight // 0.5)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.5)
-    GW=$(jq -r '(.blend.gpuWeight // 0.5)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.5)
-    ZERO=$(awk -v cw="$CW" -v gw="$GW" 'BEGIN{print (cw+gw==0)?1:0}')
-    if [[ "$ZERO" == "1" ]]; then
-      FAN_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
-    else
-      FAN_TARGET=$(awk -v c="$CPU_TARGET" -v g="$GPU_TARGET" -v cw="$CW" -v gw="$GW" 'BEGIN{printf("%d", int(c*cw + g*gw + 0.5))}')
-    fi
-  else
-    FAN_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
-  fi
-
-  # Per-fan overrides (fan4 prefers GPU weighting)
-  FAN4_MODE="gpu-weighted"
-  FAN4_CW="0.25"
-  FAN4_GW="0.75"
-  FAN4_OFFSET="0"
-  FAN4_MIN=""
-  FAN4_MAX=""
+  # Determine target for system fans (fan2, fan3)
+  SYSTEM_MODE="max"
+  SYS_CW="0.5"
+  SYS_GW="0.5"
   if command -v jq >/dev/null 2>&1; then
-    FAN4_MODE=$(jq -r '(.perFan.fan4.mode // "gpu-weighted")' "$FAN_CURVE_FILE" 2>/dev/null | tr 'A-Z' 'a-z')
-    FAN4_CW=$(jq -r '(.perFan.fan4.cpuWeight // 0.25)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.25)
-    FAN4_GW=$(jq -r '(.perFan.fan4.gpuWeight // 0.75)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.75)
-    FAN4_OFFSET=$(jq -r '(.perFan.fan4.offset // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
-    FAN4_MIN=$(jq -r '(.perFan.fan4.min // empty)' "$FAN_CURVE_FILE" 2>/dev/null || echo "")
-    FAN4_MAX=$(jq -r '(.perFan.fan4.max // empty)' "$FAN_CURVE_FILE" 2>/dev/null || echo "")
+    SYSTEM_MODE=$(jq -r '(.systemFans.mode // .blend.mode // "max")' "$FAN_CURVE_FILE" 2>/dev/null | tr 'A-Z' 'a-z')
+    SYS_CW=$(jq -r '(.systemFans.cpuWeight // .blend.cpuWeight // 0.5)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.5)
+    SYS_GW=$(jq -r '(.systemFans.gpuWeight // .blend.gpuWeight // 0.5)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.5)
   fi
-  [[ -z "$FAN4_MODE" || "$FAN4_MODE" == "null" ]] && FAN4_MODE="gpu-weighted"
-  [[ "$FAN4_CW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || FAN4_CW="0.25"
-  [[ "$FAN4_GW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || FAN4_GW="0.75"
-  [[ "$FAN4_OFFSET" =~ ^-?[0-9]+$ ]] || FAN4_OFFSET="0"
-  [[ "$FAN4_MIN" =~ ^-?[0-9]+$ ]] || FAN4_MIN=""
-  [[ "$FAN4_MAX" =~ ^-?[0-9]+$ ]] || FAN4_MAX=""
-  FAN4_TARGET=$FAN_TARGET
-  case "$FAN4_MODE" in
+  [[ -z "$SYSTEM_MODE" || "$SYSTEM_MODE" == "null" ]] && SYSTEM_MODE="max"
+  [[ "$SYS_CW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || SYS_CW="0.5"
+  [[ "$SYS_GW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || SYS_GW="0.5"
+  case "$SYSTEM_MODE" in
+    cpu)
+      SYSTEM_TARGET=$CPU_TARGET
+      ;;
     gpu|gpu_only)
-      FAN4_TARGET=$GPU_TARGET
+      SYSTEM_TARGET=$GPU_TARGET
       ;;
-    max)
-      FAN4_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
-      ;;
-    weighted|gpu-weighted|gpuweighted|default|"")
+    weighted)
       if command -v awk >/dev/null 2>&1; then
-        weighted=$(awk -v c="$CPU_TARGET" -v g="$GPU_TARGET" -v cw="$FAN4_CW" -v gw="$FAN4_GW" 'BEGIN{sum=cw+gw; if(sum<=0){ best=(g>c?g:c); } else { best=(c*cw + g*gw)/sum; } if(best<0)best=0; if(best>100)best=100; printf("%d\n", int(best+0.5)); }')
-        if [[ "$weighted" =~ ^[0-9]+$ ]]; then
-          FAN4_TARGET=$weighted
+        sum=$(awk -v cw="$SYS_CW" -v gw="$SYS_GW" 'BEGIN{printf("%f", cw+gw)}')
+        if awk -v s="$sum" 'BEGIN{exit (s==0)}'; then
+          weighted=$(awk -v c="$CPU_TARGET" -v g="$GPU_TARGET" -v cw="$SYS_CW" -v gw="$SYS_GW" 'BEGIN{sum=cw+gw; best=(c*cw + g*gw)/sum; if(best<0)best=0; if(best>100)best=100; printf("%d\n", int(best+0.5)); }')
+        else
+          weighted=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
         fi
+        if [[ "$weighted" =~ ^[0-9]+$ ]]; then
+          SYSTEM_TARGET=$weighted
+        else
+          SYSTEM_TARGET=$CPU_TARGET
+        fi
+      else
+        SYSTEM_TARGET=$CPU_TARGET
       fi
       ;;
+    max|*)
+      SYSTEM_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
+      ;;
   esac
-  if [[ "$FAN4_OFFSET" =~ ^-?[0-9]+$ ]]; then
-    FAN4_TARGET=$(( FAN4_TARGET + FAN4_OFFSET ))
+
+  # Dedicated GPU fan control (fan4)
+  GPU_MODE="gpu"
+  GPU_CW="0.25"
+  GPU_GW="0.75"
+  GPU_OFFSET="0"
+  GPU_MIN=""
+  GPU_MAX=""
+  if command -v jq >/dev/null 2>&1; then
+    GPU_MODE=$(jq -r '(.gpuFan.mode // .perFan.fan4.mode // "gpu")' "$FAN_CURVE_FILE" 2>/dev/null | tr 'A-Z' 'a-z')
+    GPU_CW=$(jq -r '(.gpuFan.cpuWeight // .perFan.fan4.cpuWeight // 0.25)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.25)
+    GPU_GW=$(jq -r '(.gpuFan.gpuWeight // .perFan.fan4.gpuWeight // 0.75)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.75)
+    GPU_OFFSET=$(jq -r '(.gpuFan.offset // .perFan.fan4.offset // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
+    GPU_MIN=$(jq -r '(.gpuFan.min // .perFan.fan4.min // empty)' "$FAN_CURVE_FILE" 2>/dev/null || echo "")
+    GPU_MAX=$(jq -r '(.gpuFan.max // .perFan.fan4.max // empty)' "$FAN_CURVE_FILE" 2>/dev/null || echo "")
   fi
-  if [[ "$FAN4_MODE" == "weighted" || "$FAN4_MODE" == "gpu-weighted" || -z "$FAN4_MODE" || "$FAN4_MODE" == "default" ]]; then
-    if (( FAN4_TARGET < FAN_TARGET )); then
-      FAN4_TARGET=$FAN_TARGET
+  [[ -z "$GPU_MODE" || "$GPU_MODE" == "null" ]] && GPU_MODE="gpu"
+  [[ "$GPU_CW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || GPU_CW="0.25"
+  [[ "$GPU_GW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || GPU_GW="0.75"
+  [[ "$GPU_OFFSET" =~ ^-?[0-9]+$ ]] || GPU_OFFSET="0"
+  [[ "$GPU_MIN" =~ ^-?[0-9]+$ ]] || GPU_MIN=""
+  [[ "$GPU_MAX" =~ ^-?[0-9]+$ ]] || GPU_MAX=""
+  case "$GPU_MODE" in
+    cpu)
+      GPU_FAN_TARGET=$CPU_TARGET
+      ;;
+    max)
+      GPU_FAN_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
+      ;;
+    weighted|gpu-weighted|default)
+      if command -v awk >/dev/null 2>&1; then
+        weighted=$(awk -v c="$CPU_TARGET" -v g="$GPU_TARGET" -v cw="$GPU_CW" -v gw="$GPU_GW" 'BEGIN{sum=cw+gw; if(sum<=0){ best=(g>c?g:c); } else { best=(c*cw + g*gw)/sum; } if(best<0)best=0; if(best>100)best=100; printf("%d\n", int(best+0.5)); }')
+        if [[ "$weighted" =~ ^[0-9]+$ ]]; then
+          GPU_FAN_TARGET=$weighted
+        else
+          GPU_FAN_TARGET=$GPU_TARGET
+        fi
+      else
+        GPU_FAN_TARGET=$GPU_TARGET
+      fi
+      ;;
+    gpu|gpu_only|*)
+      GPU_FAN_TARGET=$GPU_TARGET
+      ;;
+  esac
+  if [[ "$GPU_OFFSET" =~ ^-?[0-9]+$ ]]; then
+    GPU_FAN_TARGET=$(( GPU_FAN_TARGET + GPU_OFFSET ))
+  fi
+  if [[ -n "$GPU_MIN" ]]; then
+    if (( GPU_FAN_TARGET < GPU_MIN )); then
+      GPU_FAN_TARGET=$GPU_MIN
     fi
   fi
-  if [[ -n "$FAN4_MIN" && "$FAN4_MIN" =~ ^-?[0-9]+$ ]]; then
-    if (( FAN4_TARGET < FAN4_MIN )); then
-      FAN4_TARGET=$FAN4_MIN
+  if [[ -n "$GPU_MAX" ]]; then
+    if (( GPU_FAN_TARGET > GPU_MAX )); then
+      GPU_FAN_TARGET=$GPU_MAX
     fi
   fi
-  if [[ -n "$FAN4_MAX" && "$FAN4_MAX" =~ ^-?[0-9]+$ ]]; then
-    if (( FAN4_TARGET > FAN4_MAX )); then
-      FAN4_TARGET=$FAN4_MAX
-    fi
-  fi
-  (( FAN4_TARGET < 0 )) && FAN4_TARGET=0
-  (( FAN4_TARGET > 100 )) && FAN4_TARGET=100
 
   # Optional GPU boost when GPU temp exceeds threshold
   GB_T=$(jq -r '(.gpuBoost.threshold // empty)' "$FAN_CURVE_FILE" 2>/dev/null || true)
   GB_A=$(jq -r '(.gpuBoost.add // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
   if [[ -n "$GB_T" && "$GB_T" =~ ^[0-9]+$ && "$GPU_TEMP" -ge "$GB_T" ]]; then
-    FAN_TARGET=$(( FAN_TARGET + GB_A ))
-    FAN4_TARGET=$(( FAN4_TARGET + GB_A ))
+    SYSTEM_TARGET=$(( SYSTEM_TARGET + GB_A ))
+    GPU_FAN_TARGET=$(( GPU_FAN_TARGET + GB_A ))
   fi
-  (( FAN_TARGET < 0 )) && FAN_TARGET=0
-  (( FAN_TARGET > 100 )) && FAN_TARGET=100
-  (( FAN4_TARGET < 0 )) && FAN4_TARGET=0
-  (( FAN4_TARGET > 100 )) && FAN4_TARGET=100
-  [[ "$VERBOSE" == "1" ]] && echo "[loop] CPU=$CPU_TEMP GPU=$GPU_TEMP -> target=$FAN_TARGET fan4_override=$FAN4_TARGET" >&2
-  apply_fan_speed "$FAN_TARGET" "fan4=$FAN4_TARGET"
+  (( SYSTEM_TARGET < 0 )) && SYSTEM_TARGET=0
+  (( SYSTEM_TARGET > 100 )) && SYSTEM_TARGET=100
+  (( GPU_FAN_TARGET < 0 )) && GPU_FAN_TARGET=0
+  (( GPU_FAN_TARGET > 100 )) && GPU_FAN_TARGET=100
+  [[ "$VERBOSE" == "1" ]] && echo "[loop] CPU=$CPU_TEMP GPU=$GPU_TEMP -> system=$SYSTEM_TARGET gpuFan=$GPU_FAN_TARGET" >&2
+  apply_fan_speed "$SYSTEM_TARGET" "fan4=$GPU_FAN_TARGET"
   # Heartbeat for diagnostics
-  echo "CPU=${CPU_TEMP}C GPU=${GPU_TEMP}C target=${FAN_TARGET}%" >&2
+  echo "CPU=${CPU_TEMP}C GPU=${GPU_TEMP}C system=${SYSTEM_TARGET}% gpuFan=${GPU_FAN_TARGET}%" >&2
   # Optional runtime overrides from JSON
   if command -v jq >/dev/null 2>&1; then
     CI=$(jq -r '(.checkInterval // empty)' "$FAN_CURVE_FILE" 2>/dev/null || true)

@@ -1,7 +1,7 @@
 from flask import Flask, render_template, request, redirect, jsonify
 import json, os, subprocess, re, time, threading, shutil
 from collections import deque
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Any
 
 app = Flask(__name__)
 
@@ -15,6 +15,35 @@ FAN_IDS = ["fan2", "fan3", "fan4"]
 _ids_env = os.getenv("FAN_IDS_STR", "").strip()
 if _ids_env:
     FAN_IDS = [x for x in _ids_env.split() if x]
+
+_DEFAULT_FAN_LABELS: Dict[str, str] = {
+    "fan2": "System Fan 2",
+    "fan3": "System Fan 3",
+    "fan4": "GPU Fan 4",
+}
+_DEFAULT_FAN_GROUPS: Dict[str, str] = {
+    "fan2": "System",
+    "fan3": "System",
+    "fan4": "GPU",
+}
+_FAN_LABEL_OVERRIDES: Dict[str, str] = {}
+_FAN_GROUP_OVERRIDES: Dict[str, str] = {}
+labels_env = os.getenv("FAN_LABELS_JSON", "").strip()
+if labels_env:
+    try:
+        data = json.loads(labels_env)
+        if isinstance(data, dict):
+            _FAN_LABEL_OVERRIDES = {str(k): str(v) for k, v in data.items()}
+    except Exception:
+        pass
+groups_env = os.getenv("FAN_GROUPS_JSON", "").strip()
+if groups_env:
+    try:
+        data = json.loads(groups_env)
+        if isinstance(data, dict):
+            _FAN_GROUP_OVERRIDES = {str(k): str(v) for k, v in data.items()}
+    except Exception:
+        pass
 
 # iLO/IPMI/GPU environment toggles (optional)
 ILO_SSH_KEY = os.getenv("ILO_SSH_KEY", "/root/.ssh/ilo_key")
@@ -169,6 +198,44 @@ def get_fan_speeds():
     return vals
 
 
+def _fan_label(fan_id: str) -> str:
+    label = _FAN_LABEL_OVERRIDES.get(fan_id)
+    if label:
+        return label
+    label = _DEFAULT_FAN_LABELS.get(fan_id)
+    if label:
+        return label
+    return fan_id
+
+
+def _fan_group(fan_id: str) -> str:
+    group = _FAN_GROUP_OVERRIDES.get(fan_id)
+    if group:
+        return group
+    return _DEFAULT_FAN_GROUPS.get(fan_id, "")
+
+
+def _build_fan_categories(speeds: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    categories: List[Dict[str, Any]] = []
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for idx, fan_id in enumerate(FAN_IDS):
+        label = _fan_label(fan_id)
+        group_name = _fan_group(fan_id) or "Fans"
+        cat = by_name.get(group_name)
+        if cat is None:
+            cat = {"name": group_name, "items": []}
+            categories.append(cat)
+            by_name[group_name] = cat
+        item: Dict[str, Any] = {"id": fan_id, "label": label, "index": idx}
+        if speeds is not None and idx < len(speeds):
+            try:
+                item["speed"] = int(speeds[idx])
+            except Exception:
+                item["speed"] = speeds[idx]
+        cat["items"].append(item)
+    return categories
+
+
 def _build_ssh_base():
     base = [
         "ssh",
@@ -307,6 +374,7 @@ def _load_ui_config():
 def _apply_ui_overrides(cfg: Optional[dict] = None):
     global ILO_SSH_LEGACY, ILO_SSH_TTY, ILO_SSH_TIMEOUT, ILO_SSH_PERSIST
     global ILO_MODDED, ILO_PID_OFFSET, _EXPLICIT_PIDS, ILO_FAN_PROP, PWM_UNITS
+    global _FAN_LABEL_OVERRIDES, _FAN_GROUP_OVERRIDES
     if cfg is None:
         cfg = _load_ui_config()
     if not isinstance(cfg, dict):
@@ -331,6 +399,10 @@ def _apply_ui_overrides(cfg: Optional[dict] = None):
             ILO_FAN_PROP = str(cfg["ILO_FAN_PROP"]).strip()
         if "PWM_UNITS" in cfg:
             PWM_UNITS = str(cfg["PWM_UNITS"]).strip().lower() or "percent"
+        if "fan_labels" in cfg and isinstance(cfg["fan_labels"], dict):
+            _FAN_LABEL_OVERRIDES = {str(k): str(v) for k, v in cfg["fan_labels"].items()}
+        if "fan_groups" in cfg and isinstance(cfg["fan_groups"], dict):
+            _FAN_GROUP_OVERRIDES = {str(k): str(v) for k, v in cfg["fan_groups"].items()}
     except Exception:
         pass
 
@@ -871,6 +943,7 @@ def get_temps():
 @app.route("/")
 def index():
     # Provide current settings for UI
+    fan_speeds = get_fan_speeds()
     settings = {
         "ILO_SSH_LEGACY": 1 if ILO_SSH_LEGACY else 0,
         "ILO_SSH_TTY": 1 if ILO_SSH_TTY else 0,
@@ -888,7 +961,10 @@ def index():
     return render_template(
         "index.html",
         fan_curve=load_curve(),
-        fan_speeds=get_fan_speeds(),
+        fan_speeds=fan_speeds,
+        fan_labels=[_fan_label(fid) for fid in FAN_IDS],
+        fan_groups=[_fan_group(fid) for fid in FAN_IDS],
+        fan_categories=_build_fan_categories(fan_speeds),
         cpu_temp="",
         gpu_temp="",
         settings=settings,
@@ -902,6 +978,8 @@ def status():
     sensors = _get_additional_sensors()
     gpu_info = _get_gpu_snapshot()
     svc = _get_service_status()
+    fan_labels = [_fan_label(fid) for fid in FAN_IDS]
+    fan_groups = [_fan_group(fid) for fid in FAN_IDS]
 
     speed_mtime = 0.0
     for path in (FAN_SPEED_FILE, FAN_SPEED_BITS_FILE):
@@ -967,9 +1045,12 @@ def status():
     except Exception:
         last_obj = None
 
+    speeds = get_fan_speeds()
     return jsonify({
         "cpu": cpu, "gpu": gpu, "gpu_name": gpu_name, "gpu_power": gpu_power,
-    "fans": get_fan_speeds(), "fan_bits": fan_bits, "fans_ids": FAN_IDS,
+    "fans": speeds, "fan_bits": fan_bits, "fans_ids": FAN_IDS,
+    "fan_labels": fan_labels, "fan_groups": fan_groups,
+    "fan_categories": _build_fan_categories(speeds),
     "ilo_fan_percents": ilo_map, "ilo_actuals_age": max(0, ilo_age),
     "ilo_queue_depth": qdepth, "ilo_queue_waiting": waiting, "ilo_queue_active": active,
     "ilo_last_cmd": last_obj,

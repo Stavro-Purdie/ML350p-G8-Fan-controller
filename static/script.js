@@ -37,6 +37,10 @@ function poll() {
   fetch('/status')
     .then(res => res.json())
     .then(data => {
+      const ids = Array.isArray(data.fans_ids) ? data.fans_ids : [];
+      const labels = Array.isArray(data.fan_labels) ? data.fan_labels : [];
+      const groups = Array.isArray(data.fan_groups) ? data.fan_groups : [];
+      const categories = Array.isArray(data.fan_categories) ? data.fan_categories : null;
       const cpu = parseInt(data.cpu || '0', 10) || 0;
       const gpu = parseInt(data.gpu || '0', 10) || 0;
       document.getElementById('cpu').innerText = data.cpu;
@@ -46,28 +50,85 @@ function poll() {
       const health = document.getElementById('health');
       if (health && data.ok) {
         health.style.display = 'block';
-        health.innerText = `Status OK • Fans: ${data.fans.join(', ')}%`;
+        const summary = data.fans.map((val, idx) => {
+          const name = labels[idx] || ids[idx] || `Fan ${idx + 1}`;
+          const group = groups[idx] ? `${groups[idx]} ` : '';
+          return `${group}${name} ${val}%`;
+        }).join(', ');
+        health.innerText = `Status OK • Fans: ${summary}`;
       }
       const fanList = document.getElementById('fan-speeds');
       fanList.innerHTML = '';
       const ilo = data.ilo_fan_percents || {};
       const bits = data.fan_bits || [];
-      const ids = data.fans_ids || [];
-      data.fans.forEach((f, i) => {
+      const buildFanRow = (idx, options = {}) => {
+        if (idx == null || idx < 0 || idx >= data.fans.length) {
+          return null;
+        }
+        const { showGroup = true, overrideSpeed } = options;
         const li = document.createElement('li');
+        li.className = 'fan-item';
+        const fanId = ids[idx] || `fan${idx + 1}`;
+        const label = labels[idx] || fanId;
+        const group = groups[idx] || '';
+        const header = document.createElement('div');
+        header.className = 'fan-header';
+        const prefix = showGroup && group ? `${group} • ` : '';
+        header.textContent = `${prefix}${label} (${fanId})`;
+        li.appendChild(header);
         const meter = document.createElement('div');
         meter.className = 'meter';
         const bar = document.createElement('div');
         bar.className = 'bar';
-        bar.style.width = (parseInt(f, 10) || 0) + '%';
+        let displayValue = data.fans[idx];
+        if (displayValue === undefined || displayValue === null || displayValue === '') {
+          displayValue = overrideSpeed ?? 0;
+        }
+        const pctNum = parseInt(displayValue, 10);
+        const pctWidth = Number.isNaN(pctNum) ? 0 : Math.max(0, Math.min(100, pctNum));
+        bar.style.width = `${pctWidth}%`;
         meter.appendChild(bar);
         li.appendChild(meter);
-        const raw = bits[i] ?? '';
-        const fanId = ids[i] || `fan${i+1}`;
-        const iloPct = (ilo && fanId in ilo) ? ` | iLO ${ilo[fanId]}%` : '';
-        li.append(` ${f}% (raw ${raw||''}/255)${iloPct}`);
-        fanList.appendChild(li);
-      });
+        const raw = bits[idx] ?? '';
+        const iloPct = (ilo && Object.prototype.hasOwnProperty.call(ilo, fanId)) ? ` | iLO ${ilo[fanId]}%` : '';
+        const detail = document.createElement('div');
+        detail.className = 'fan-detail';
+        detail.textContent = `${displayValue}% (raw ${raw || ''}/255)${iloPct}`;
+        li.appendChild(detail);
+        return li;
+      };
+      let appended = false;
+      if (categories && categories.length) {
+        categories.forEach(cat => {
+          if (!cat || !Array.isArray(cat.items) || cat.items.length === 0) return;
+          const catLi = document.createElement('li');
+          catLi.className = 'fan-category';
+          const title = document.createElement('div');
+          title.className = 'fan-category-title';
+          title.textContent = cat.name || 'Fans';
+          catLi.appendChild(title);
+          const inner = document.createElement('ul');
+          inner.className = 'fan-category-items';
+          cat.items.forEach(item => {
+            const idx = typeof item.index === 'number' ? item.index : ids.indexOf(item.id);
+            const row = buildFanRow(idx, { showGroup: false, overrideSpeed: item.speed });
+            if (row) {
+              inner.appendChild(row);
+            }
+          });
+          if (inner.children.length) {
+            catLi.appendChild(inner);
+            fanList.appendChild(catLi);
+            appended = true;
+          }
+        });
+      }
+      if (!appended) {
+        data.fans.forEach((_, i) => {
+          const row = buildFanRow(i, { showGroup: true });
+          if (row) fanList.appendChild(row);
+        });
+      }
       // Sensors table
       const tbody = document.querySelector('#sensors tbody');
       if (tbody && Array.isArray(data.sensors)) {
@@ -107,9 +168,15 @@ function poll() {
         if (!fanSeriesInit) {
           const colors = ['#2ecc71','#1abc9c','#9b59b6','#f1c40f','#e67e22','#34495e','#16a085','#8e44ad'];
           fanChart.data.datasets = data.fans.map((_, i) => ({
-            label: `Fan ${i+1} (%)`, data: [], borderColor: colors[i % colors.length], fill: false
+            label: labels[i] || ids[i] || `Fan ${i+1}`, data: [], borderColor: colors[i % colors.length], fill: false
           }));
           fanSeriesInit = true;
+        }
+        if (fanChart.data.datasets.length === data.fans.length) {
+          fanChart.data.datasets.forEach((ds, idx) => {
+            const lbl = labels[idx] || ids[idx] || ds.label;
+            if (lbl && ds.label !== lbl) ds.label = lbl;
+          });
         }
         const fans = data.fans.map(v => v ?? null);
         pushData(fanChart, fans);
@@ -121,6 +188,7 @@ function poll() {
             tGPU: tempChart.data.datasets[1].data.slice(-60),
             fLabels: fanChart.data.labels.slice(-60),
             fSeries: fanChart.data.datasets.map(d => d.data.slice(-60)),
+            fNames: labels,
           };
           localStorage.setItem('dfc_history', JSON.stringify(payload));
         } catch (_) {}
@@ -162,11 +230,16 @@ window.addEventListener('load', () => {
       const seriesCount = (h.fSeries && h.fSeries.length) || 0;
       if (fanChart.data.datasets.length !== seriesCount) {
         fanChart.data.datasets = Array.from({length: seriesCount}, (_, i) => ({
-          label: `Fan ${i+1} (%)`, data: [], borderColor: colors[i % colors.length], fill: false
+          label: (h.fNames && h.fNames[i]) || `Fan ${i+1}`, data: [], borderColor: colors[i % colors.length], fill: false
         }));
       }
       fanChart.data.labels = h.fLabels || [];
       fanChart.data.datasets.forEach((d, i) => { d.data = (h.fSeries && h.fSeries[i]) || []; });
+      if (h.fNames) {
+        fanChart.data.datasets.forEach((d, i) => {
+          if (h.fNames[i]) d.label = h.fNames[i];
+        });
+      }
       fanChart.update('none');
       fanSeriesInit = fanChart.data.datasets.length > 0;
     }
