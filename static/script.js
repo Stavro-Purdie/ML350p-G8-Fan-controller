@@ -549,7 +549,11 @@ function poll() {
           if (Number.isFinite(targetSpeed)) {
             const targetPill = document.createElement('span');
             targetPill.className = 'advisory-pill advisory-target';
-            targetPill.textContent = `→ ${Math.round(targetSpeed)}%`;
+            if (negligibleChange || unpredictable) {
+              targetPill.textContent = unpredictable ? 'No fan change (unpredictable)' : 'No fan change needed';
+            } else {
+              targetPill.textContent = `→ ${Math.round(targetSpeed)}%`;
+            }
             advisory.appendChild(targetPill);
           }
           if (Number.isFinite(predictive.offset) && Math.abs(predictive.offset) >= 0.3) {
