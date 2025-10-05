@@ -235,17 +235,20 @@ get_cpu_temp() {
   sensors_out=$(sensors 2>/dev/null)
   local val pkg hottest
   pkg=$(printf "%s\n" "$sensors_out" | awk '
-    BEGIN { pkg="" }
+    BEGIN { pkg = "" }
     /Package id/ {
       for (i = 1; i <= NF; i++) {
         if ($i ~ /\+[0-9]/) {
           val = $i
-          gsub(/[^0-9]/, "", val)
-          if (val != "") { pkg = val; exit }
+          gsub(/[^0-9.]/, "", val)
+          if (val != "") {
+            pkg = val + 0
+            break
+          }
         }
       }
     }
-    END { if (pkg != "") print pkg }
+    END { if (pkg != "") printf "%d\n", int(pkg) }
   ')
   if [[ -n "$pkg" ]]; then
     val=$pkg
@@ -256,12 +259,13 @@ get_cpu_temp() {
         for (i = 1; i <= NF; i++) {
           if ($i ~ /\+[0-9]/) {
             temp = $i
-            gsub(/[^0-9]/, "", temp)
-            if (temp+0 > max) { max = temp+0 }
+            gsub(/[^0-9.]/, "", temp)
+            val = temp + 0
+            if (val > max) { max = val }
           }
         }
       }
-      END { if (max > 0) print int(max) }
+      END { if (max > 0) printf "%d\n", int(max) }
     ')
     [[ -n "$hottest" ]] && val=$hottest || val=""
   fi
