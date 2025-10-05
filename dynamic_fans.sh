@@ -314,7 +314,17 @@ calc_targets() {
 }
 
 apply_fan_speed() {
-  local target=$1
+  local default_target=$1
+  shift
+  declare -A overrides=()
+  local entry fan val
+  for entry in "$@"; do
+    [[ "$entry" == *=* ]] || continue
+    fan=${entry%%=*}
+    val=${entry#*=}
+    [[ -n "$fan" ]] || continue
+    overrides["$fan"]=$val
+  done
   local updates_sent=0
   local updated_pids=()
   # Helper to set speed with path fallbacks
@@ -358,10 +368,19 @@ apply_fan_speed() {
       local fan_id=${P_IDS[$idx]}
       local fan=${FAN_IDS[$idx]:-fan$fan_id}
       CURRENT=${LAST_SPEEDS[$fan]:-20}
-      # All fans follow same target percent
-      local desired=$target
-      # When operating in bits domain, do smoothing in bits
-  if [[ "$PWM_UNITS" == "bits" ]]; then
+      local desired
+      if [[ ${overrides[$fan]+_} ]]; then
+        desired=${overrides[$fan]}
+      else
+        desired=$default_target
+      fi
+      if [[ ! "$desired" =~ ^-?[0-9]+$ ]]; then
+        desired=$default_target
+      fi
+      (( desired < 0 )) && desired=0
+      (( desired > 100 )) && desired=100
+    # When operating in bits domain, do smoothing in bits
+    if [[ "$PWM_UNITS" == "bits" ]]; then
         # current bits fallback from current percent
         local cur_b=${LAST_BITS[$fan]:-0}
         if (( cur_b <= 0 )); then cur_b=$(( (CURRENT * 255 + 50) / 100 )); fi
@@ -452,34 +471,43 @@ apply_fan_speed() {
       fi
     done
   else
-  for fan in "${FAN_IDS[@]}"; do
-  CURRENT=${LAST_SPEEDS[$fan]:-20}
-  # All fans target the same percent
-  desired=$target
-  DIFF=$(( desired - CURRENT ))
-    # Optional minimum change to avoid oscillation
-    if command -v jq >/dev/null 2>&1; then
-      MINC=$(jq -r '(.minChange // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
-      [[ "$MINC" =~ ^-?[0-9]+$ ]] || MINC=0
-      if (( DIFF != 0 && ${DIFF#-} < MINC )); then
-        DIFF=$(( DIFF<0 ? -MINC : MINC ))
+    for fan in "${FAN_IDS[@]}"; do
+      CURRENT=${LAST_SPEEDS[$fan]:-20}
+      local desired
+      if [[ ${overrides[$fan]+_} ]]; then
+        desired=${overrides[$fan]}
+      else
+        desired=$default_target
       fi
-    fi
-    if (( DIFF > MAX_STEP )); then DIFF=$MAX_STEP
-    elif (( DIFF < -MAX_STEP )); then DIFF=-MAX_STEP; fi
-    NEW=$(( CURRENT + DIFF ))
-    # Clamp to [0,100]
-    (( NEW < 0 )) && NEW=0
-    (( NEW > 100 )) && NEW=100
-    if (( NEW != CURRENT )); then
-      if ! ilo_set_speed "$fan" "$NEW"; then
-        echo "WARN: Failed to set $fan to $NEW" >&2
+      if [[ ! "$desired" =~ ^-?[0-9]+$ ]]; then
+        desired=$default_target
       fi
-      # separation between per-fan sets only when we send a command
-      sleep_ms "$ILO_CMD_GAP_MS"
-      LAST_SPEEDS[$fan]=$NEW
-      ((updates_sent++))
-    fi
+      (( desired < 0 )) && desired=0
+      (( desired > 100 )) && desired=100
+      DIFF=$(( desired - CURRENT ))
+      # Optional minimum change to avoid oscillation
+      if command -v jq >/dev/null 2>&1; then
+        MINC=$(jq -r '(.minChange // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
+        [[ "$MINC" =~ ^-?[0-9]+$ ]] || MINC=0
+        if (( DIFF != 0 && ${DIFF#-} < MINC )); then
+          DIFF=$(( DIFF<0 ? -MINC : MINC ))
+        fi
+      fi
+      if (( DIFF > MAX_STEP )); then DIFF=$MAX_STEP
+      elif (( DIFF < -MAX_STEP )); then DIFF=-MAX_STEP; fi
+      NEW=$(( CURRENT + DIFF ))
+      # Clamp to [0,100]
+      (( NEW < 0 )) && NEW=0
+      (( NEW > 100 )) && NEW=100
+      if (( NEW != CURRENT )); then
+        if ! ilo_set_speed "$fan" "$NEW"; then
+          echo "WARN: Failed to set $fan to $NEW" >&2
+        fi
+        # separation between per-fan sets only when we send a command
+        sleep_ms "$ILO_CMD_GAP_MS"
+        LAST_SPEEDS[$fan]=$NEW
+        ((updates_sent++))
+      fi
     done
   fi
   if [[ "$VERBOSE" == "1" ]]; then
@@ -520,16 +548,79 @@ while true; do
   else
     FAN_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
   fi
+
+  # Per-fan overrides (fan4 prefers GPU weighting)
+  FAN4_MODE="gpu-weighted"
+  FAN4_CW="0.25"
+  FAN4_GW="0.75"
+  FAN4_OFFSET="0"
+  FAN4_MIN=""
+  FAN4_MAX=""
+  if command -v jq >/dev/null 2>&1; then
+    FAN4_MODE=$(jq -r '(.perFan.fan4.mode // "gpu-weighted")' "$FAN_CURVE_FILE" 2>/dev/null | tr 'A-Z' 'a-z')
+    FAN4_CW=$(jq -r '(.perFan.fan4.cpuWeight // 0.25)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.25)
+    FAN4_GW=$(jq -r '(.perFan.fan4.gpuWeight // 0.75)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.75)
+    FAN4_OFFSET=$(jq -r '(.perFan.fan4.offset // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
+    FAN4_MIN=$(jq -r '(.perFan.fan4.min // empty)' "$FAN_CURVE_FILE" 2>/dev/null || echo "")
+    FAN4_MAX=$(jq -r '(.perFan.fan4.max // empty)' "$FAN_CURVE_FILE" 2>/dev/null || echo "")
+  fi
+  [[ -z "$FAN4_MODE" || "$FAN4_MODE" == "null" ]] && FAN4_MODE="gpu-weighted"
+  [[ "$FAN4_CW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || FAN4_CW="0.25"
+  [[ "$FAN4_GW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || FAN4_GW="0.75"
+  [[ "$FAN4_OFFSET" =~ ^-?[0-9]+$ ]] || FAN4_OFFSET="0"
+  [[ "$FAN4_MIN" =~ ^-?[0-9]+$ ]] || FAN4_MIN=""
+  [[ "$FAN4_MAX" =~ ^-?[0-9]+$ ]] || FAN4_MAX=""
+  FAN4_TARGET=$FAN_TARGET
+  case "$FAN4_MODE" in
+    gpu|gpu_only)
+      FAN4_TARGET=$GPU_TARGET
+      ;;
+    max)
+      FAN4_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
+      ;;
+    weighted|gpu-weighted|gpuweighted|default|"")
+      if command -v awk >/dev/null 2>&1; then
+        weighted=$(awk -v c="$CPU_TARGET" -v g="$GPU_TARGET" -v cw="$FAN4_CW" -v gw="$FAN4_GW" 'BEGIN{sum=cw+gw; if(sum<=0){ best=(g>c?g:c); } else { best=(c*cw + g*gw)/sum; } if(best<0)best=0; if(best>100)best=100; printf("%d\n", int(best+0.5)); }')
+        if [[ "$weighted" =~ ^[0-9]+$ ]]; then
+          FAN4_TARGET=$weighted
+        fi
+      fi
+      ;;
+  esac
+  if [[ "$FAN4_OFFSET" =~ ^-?[0-9]+$ ]]; then
+    FAN4_TARGET=$(( FAN4_TARGET + FAN4_OFFSET ))
+  fi
+  if [[ "$FAN4_MODE" == "weighted" || "$FAN4_MODE" == "gpu-weighted" || -z "$FAN4_MODE" || "$FAN4_MODE" == "default" ]]; then
+    if (( FAN4_TARGET < FAN_TARGET )); then
+      FAN4_TARGET=$FAN_TARGET
+    fi
+  fi
+  if [[ -n "$FAN4_MIN" && "$FAN4_MIN" =~ ^-?[0-9]+$ ]]; then
+    if (( FAN4_TARGET < FAN4_MIN )); then
+      FAN4_TARGET=$FAN4_MIN
+    fi
+  fi
+  if [[ -n "$FAN4_MAX" && "$FAN4_MAX" =~ ^-?[0-9]+$ ]]; then
+    if (( FAN4_TARGET > FAN4_MAX )); then
+      FAN4_TARGET=$FAN4_MAX
+    fi
+  fi
+  (( FAN4_TARGET < 0 )) && FAN4_TARGET=0
+  (( FAN4_TARGET > 100 )) && FAN4_TARGET=100
+
   # Optional GPU boost when GPU temp exceeds threshold
   GB_T=$(jq -r '(.gpuBoost.threshold // empty)' "$FAN_CURVE_FILE" 2>/dev/null || true)
   GB_A=$(jq -r '(.gpuBoost.add // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
   if [[ -n "$GB_T" && "$GB_T" =~ ^[0-9]+$ && "$GPU_TEMP" -ge "$GB_T" ]]; then
     FAN_TARGET=$(( FAN_TARGET + GB_A ))
+    FAN4_TARGET=$(( FAN4_TARGET + GB_A ))
   fi
   (( FAN_TARGET < 0 )) && FAN_TARGET=0
   (( FAN_TARGET > 100 )) && FAN_TARGET=100
-  [[ "$VERBOSE" == "1" ]] && echo "[loop] CPU=$CPU_TEMP GPU=$GPU_TEMP -> target=$FAN_TARGET" >&2
-  apply_fan_speed $FAN_TARGET
+  (( FAN4_TARGET < 0 )) && FAN4_TARGET=0
+  (( FAN4_TARGET > 100 )) && FAN4_TARGET=100
+  [[ "$VERBOSE" == "1" ]] && echo "[loop] CPU=$CPU_TEMP GPU=$GPU_TEMP -> target=$FAN_TARGET fan4_override=$FAN4_TARGET" >&2
+  apply_fan_speed "$FAN_TARGET" "fan4=$FAN4_TARGET"
   # Heartbeat for diagnostics
   echo "CPU=${CPU_TEMP}C GPU=${GPU_TEMP}C target=${FAN_TARGET}%" >&2
   # Optional runtime overrides from JSON

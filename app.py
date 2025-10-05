@@ -1,7 +1,7 @@
 from flask import Flask, render_template, request, redirect, jsonify
 import json, os, subprocess, re, time, threading, shutil
 from collections import deque
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 app = Flask(__name__)
 
@@ -48,6 +48,18 @@ try:
     ILO_BATCH_SIZE = int(os.getenv("ILO_BATCH_SIZE", "1"))
 except Exception:
     ILO_BATCH_SIZE = 1
+try:
+    ILO_ACTUALS_PRIORITY = int(os.getenv("ILO_ACTUALS_PRIORITY", "2"))
+except Exception:
+    ILO_ACTUALS_PRIORITY = 2
+try:
+    ILO_ACTUALS_MIN_INTERVAL = float(os.getenv("ILO_ACTUALS_MIN_INTERVAL", "4"))
+except Exception:
+    ILO_ACTUALS_MIN_INTERVAL = 4.0
+if ILO_ACTUALS_PRIORITY < 0:
+    ILO_ACTUALS_PRIORITY = 0
+if ILO_ACTUALS_MIN_INTERVAL < 0.5:
+    ILO_ACTUALS_MIN_INTERVAL = 0.5
 
 # iLO fan object search paths and property candidates
 FAN_PATHS = ["/system1", "/system1/fans1"]
@@ -196,6 +208,7 @@ _ILO_RECENT = deque(maxlen=200)
 _ILO_ACTUALS = {"ts": 0.0, "map": {}}
 _ILO_ACTUALS_LOCK = threading.Lock()
 _ILO_ACTUALS_REFRESHING = False
+_LAST_SPEED_MTIME = 0.0
 
 # Shared cache for other expensive status lookups (gpu info, sensors, etc.)
 _CACHE_LOCK = threading.Lock()
@@ -223,6 +236,9 @@ class _CmdItem:
 
 _ILO_QUEUE: "queue.PriorityQueue[_CmdItem]" = queue.PriorityQueue()
 _ILO_SEQ = 0
+_ILO_QUEUE_LOCK = threading.Lock()
+_ILO_PENDING = 0
+_ILO_ACTIVE = 0
 
 
 def _get_cached(name: str, ttl: float, loader, default):
@@ -244,12 +260,15 @@ def _get_cached(name: str, ttl: float, loader, default):
         return prev_data
 
 def _ilo_worker():
+    global _ILO_ACTIVE
     while True:
         item: _CmdItem = _ILO_QUEUE.get()
         try:
             # Cross-process lock to serialize against daemon
             lock_fd = None
             try:
+                with _ILO_QUEUE_LOCK:
+                    _ILO_ACTIVE += 1
                 os.makedirs(os.path.dirname(_ILO_LOCK_FILE), exist_ok=True)
                 lock_fd = os.open(_ILO_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o666)
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -268,6 +287,8 @@ def _ilo_worker():
                     except Exception:
                         pass
         finally:
+            with _ILO_QUEUE_LOCK:
+                _ILO_ACTIVE = max(0, _ILO_ACTIVE - 1)
             item.event.set()
             _ILO_QUEUE.task_done()
 
@@ -340,12 +361,19 @@ def _ilo_run(cmd: str, timeout: Optional[int] = None, priority: int = 5) -> str:
     # Enqueue the command for serialized execution within this process
     if timeout is None:
         timeout = ILO_SSH_TIMEOUT
-    global _ILO_SEQ
-    _ILO_SEQ += 1
-    item = _CmdItem(priority, _ILO_SEQ, cmd, timeout)
+    global _ILO_SEQ, _ILO_PENDING
+    with _ILO_QUEUE_LOCK:
+        _ILO_SEQ += 1
+        seq = _ILO_SEQ
+        _ILO_PENDING += 1
+    item = _CmdItem(priority, seq, cmd, timeout)
     _ILO_QUEUE.put(item)
     # Block until completion or timeout (worker handles subprocess timeout internally)
-    item.event.wait(timeout + 5)
+    completed = item.event.wait(timeout + 5)
+    with _ILO_QUEUE_LOCK:
+        _ILO_PENDING = max(0, _ILO_PENDING - 1)
+    if not completed:
+        raise TimeoutError(f"iLO command timed out: {cmd}")
     if item.err:
         raise item.err
     return item.out or ""
@@ -366,12 +394,34 @@ def _ilo_try(cmd: str, attempts: int = 2, timeout: Optional[int] = None, priorit
     return ""
 
 
+def _parse_fans_show(out: str) -> Dict[str, int]:
+    result: Dict[str, int] = {}
+    if not out:
+        return result
+    for line in out.splitlines():
+        lower = line.lower()
+        m = re.search(r"fan\s*([0-9]+)", lower)
+        if not m:
+            continue
+        fan = f"fan{m.group(1)}"
+        m_pct = re.search(r"(\d{1,3})\s*%", line)
+        if not m_pct:
+            continue
+        try:
+            val = int(m_pct.group(1))
+        except Exception:
+            continue
+        if 0 <= val <= 100:
+            result[fan] = val
+    return result
+
+
 def _trigger_ilo_actuals_refresh(force: bool = False):
     global _ILO_ACTUALS_REFRESHING
     now = time.time()
     with _ILO_ACTUALS_LOCK:
         age = now - _ILO_ACTUALS.get("ts", 0)
-        if not force and age < 10:
+        if not force and age < ILO_ACTUALS_MIN_INTERVAL:
             return
         if _ILO_ACTUALS_REFRESHING:
             return
@@ -380,6 +430,11 @@ def _trigger_ilo_actuals_refresh(force: bool = False):
     def worker():
         global _ILO_ACTUALS_REFRESHING
         actuals_map = {}
+        priority = ILO_ACTUALS_PRIORITY
+        if priority < 0:
+            priority = 0
+        elif priority > 9:
+            priority = 9
         try:
             with _ILO_ACTUALS_LOCK:
                 actuals_map = dict(_ILO_ACTUALS.get("map", {}))
@@ -389,11 +444,25 @@ def _trigger_ilo_actuals_refresh(force: bool = False):
                     fans = FAN_IDS
             except Exception:
                 fans = FAN_IDS
-            for idx, fan in enumerate(fans):
+            missing = list(fans)
+            try:
+                combined = _parse_fans_show(_ilo_run("fans show", timeout=6, priority=priority))
+            except Exception:
+                combined = {}
+            if combined:
+                for fan, val in combined.items():
+                    actuals_map[fan] = val
+                    if fan in missing:
+                        try:
+                            missing.remove(fan)
+                        except ValueError:
+                            pass
+            gap = max(1.0, ILO_CMD_GAP_MS / 1000.0)
+            for idx, fan in enumerate(missing):
                 try:
                     if idx > 0:
-                        time.sleep(5)
-                    out = _ilo_run(f"show /system1/{fan}", timeout=5, priority=9)
+                        time.sleep(gap)
+                    out = _ilo_run(f"show /system1/{fan}", timeout=5, priority=priority)
                 except Exception:
                     continue
                 val = None
@@ -828,20 +897,42 @@ def index():
 
 @app.route("/status")
 def status():
+    global _LAST_SPEED_MTIME
     cpu, gpu, gpu_name, gpu_power = get_temps()
     sensors = _get_additional_sensors()
     gpu_info = _get_gpu_snapshot()
     svc = _get_service_status()
 
+    speed_mtime = 0.0
+    for path in (FAN_SPEED_FILE, FAN_SPEED_BITS_FILE):
+        if not path:
+            continue
+        try:
+            m = os.path.getmtime(path)
+        except Exception:
+            continue
+        if m > speed_mtime:
+            speed_mtime = m
+
     # Ensure background refresh kicked off for iLO actuals if stale
+    last_speed_mtime = 0.0
     with _ILO_ACTUALS_LOCK:
         ilo_map = dict(_ILO_ACTUALS.get("map", {}))
         ilo_ts = _ILO_ACTUALS.get("ts", 0)
         refreshing = _ILO_ACTUALS_REFRESHING
+        last_speed_mtime = _LAST_SPEED_MTIME
     now = time.time()
-    if not ilo_map and ilo_ts == 0:
+    force_refresh = False
+    if speed_mtime and speed_mtime > last_speed_mtime + 0.001:
+        force_refresh = True
+        with _ILO_ACTUALS_LOCK:
+            if speed_mtime > _LAST_SPEED_MTIME:
+                _LAST_SPEED_MTIME = speed_mtime
+    if force_refresh:
         _trigger_ilo_actuals_refresh(force=True)
-    elif now - ilo_ts > 10 and not refreshing:
+    elif not ilo_map and ilo_ts == 0:
+        _trigger_ilo_actuals_refresh(force=True)
+    elif now - ilo_ts > ILO_ACTUALS_MIN_INTERVAL and not refreshing:
         _trigger_ilo_actuals_refresh()
     ilo_age = int(now - ilo_ts) if ilo_ts else -1
 
@@ -853,9 +944,15 @@ def status():
 
     # Queue depth and last command summary for UI indicators
     try:
-        qdepth = _ILO_QUEUE.qsize()
+        waiting = _ILO_QUEUE.qsize()
     except Exception:
-        qdepth = 0
+        waiting = 0
+    with _ILO_QUEUE_LOCK:
+        pending = _ILO_PENDING
+        active = _ILO_ACTIVE
+    if waiting > pending:
+        waiting = pending
+    qdepth = pending
     try:
         last_item = _ILO_RECENT[-1] if len(_ILO_RECENT) > 0 else None
         if last_item:
@@ -873,8 +970,9 @@ def status():
     return jsonify({
         "cpu": cpu, "gpu": gpu, "gpu_name": gpu_name, "gpu_power": gpu_power,
     "fans": get_fan_speeds(), "fan_bits": fan_bits, "fans_ids": FAN_IDS,
-        "ilo_fan_percents": ilo_map, "ilo_actuals_age": max(0, ilo_age),
-        "ilo_queue_depth": qdepth, "ilo_last_cmd": last_obj,
+    "ilo_fan_percents": ilo_map, "ilo_actuals_age": max(0, ilo_age),
+    "ilo_queue_depth": qdepth, "ilo_queue_waiting": waiting, "ilo_queue_active": active,
+    "ilo_last_cmd": last_obj,
         "sensors": sensors, "gpu_info": gpu_info,
         "service": svc, "ok": True,
     })

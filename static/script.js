@@ -130,11 +130,14 @@ function poll() {
       const qdiv = document.getElementById('queueInfo');
       if (qdiv) {
         const depth = data.ilo_queue_depth ?? 0;
+        const waiting = data.ilo_queue_waiting ?? depth;
+        const active = data.ilo_queue_active ?? 0;
         const last = data.ilo_last_cmd || null;
-        if (depth || last) {
+        if (depth || last || active) {
           qdiv.style.display = 'block';
+          const queueText = `pending ${depth} (waiting ${waiting}, active ${active})`;
           const lastText = last ? ` • last [${last.time}] rc=${last.rc ?? ''} ${last.ms ?? ''}ms :: ${last.cmd || ''}` : '';
-          qdiv.textContent = `iLO queue depth: ${depth}${lastText}`;
+          qdiv.textContent = `iLO queue: ${queueText}${lastText}`;
         } else {
           qdiv.style.display = 'none';
         }
