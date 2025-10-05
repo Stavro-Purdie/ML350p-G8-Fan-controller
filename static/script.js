@@ -4,7 +4,13 @@ let fanSeriesInit = false;
 const maxPoints = 120; // ~10 minutes at 5s
 const fanHistory = {};
 const fanHistoryLimit = 36; // ~3 minutes of samples at 5s
-const trendHorizonSeconds = 60;
+const trendHorizonSeconds = 20;
+const VOLATILE_PERIOD_SECONDS = 20;
+const VOLATILE_PERIOD_TOLERANCE = 0.10;
+const TREND_RISE_THRESHOLD = 15;
+const TREND_SPIKE_THRESHOLD = 30;
+const TREND_FALL_THRESHOLD = -15;
+const TREND_PLUNGE_THRESHOLD = -30;
 let updateInProgress = false;
 let fanCurveConfig = null;
 const tempHistory = {
@@ -76,13 +82,16 @@ const computeTrend = (points, horizonSeconds = trendHorizonSeconds) => {
   let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
   let signFlips = 0;
   let lastDiffSign = 0;
+  const flipTimes = [];
   let maxJump = 0;
   for (let i = 1; i < points.length; i += 1) {
     const diff = points[i].value - points[i - 1].value;
     maxJump = Math.max(maxJump, Math.abs(diff));
+    const elapsedSeconds = (points[i].t - base) / 1000;
     const sign = diff === 0 ? 0 : (diff > 0 ? 1 : -1);
     if (sign !== 0 && lastDiffSign !== 0 && sign !== lastDiffSign) {
       signFlips += 1;
+      flipTimes.push(elapsedSeconds);
     }
     if (sign !== 0) lastDiffSign = sign;
   }
@@ -106,7 +115,20 @@ const computeTrend = (points, horizonSeconds = trendHorizonSeconds) => {
   let effectiveHorizon = horizonSeconds;
   const recentDiff = points[n - 1].value - points[n - 2].value;
   const velocity = slope;
-  const volatility = signFlips >= 2 || maxJump >= 35 || Math.abs(recentDiff) >= 30;
+  const flipIntervals = [];
+  for (let i = 1; i < flipTimes.length; i += 1) {
+    const gap = flipTimes[i] - flipTimes[i - 1];
+    if (Number.isFinite(gap) && gap > 0) {
+      flipIntervals.push(gap);
+    }
+  }
+  const targetPeriod = VOLATILE_PERIOD_SECONDS;
+  const tolerance = VOLATILE_PERIOD_TOLERANCE;
+  const minPeriod = targetPeriod * (1 - tolerance);
+  const maxPeriod = targetPeriod * (1 + tolerance);
+  const periodVolatility = flipIntervals.length > 0 && flipIntervals.every((sec) => sec >= minPeriod && sec <= maxPeriod);
+  const jumpVolatility = maxJump >= 35 || Math.abs(recentDiff) >= 30;
+  const volatility = (signFlips >= 2 && periodVolatility) || jumpVolatility;
   if (volatility) {
     effectiveHorizon = Math.max(10, Math.min(25, horizonSeconds / 2));
   } else if (Math.abs(velocity) > 1.8) {
@@ -125,20 +147,20 @@ const computeTrend = (points, horizonSeconds = trendHorizonSeconds) => {
     delta = 0;
     roundDelta = 0;
     forecast = current;
-  } else if (delta >= 10) {
+  } else if (delta >= TREND_SPIKE_THRESHOLD) {
     label = 'Spiking';
     icon = '⤴';
     className = 'trend-spike';
-  } else if (delta >= 5) {
+  } else if (delta >= TREND_RISE_THRESHOLD) {
     label = 'Rising';
     icon = '↑';
     className = 'trend-up';
-  } else if (delta <= -10) {
+  } else if (delta <= TREND_PLUNGE_THRESHOLD) {
     label = 'Plunging';
     icon = '⤵';
     className = 'trend-plunge';
-  } else if (delta <= -5) {
-    label = 'Falling';
+  } else if (delta <= TREND_FALL_THRESHOLD) {
+    label = 'Lowering';
     icon = '↓';
     className = 'trend-down';
   }
