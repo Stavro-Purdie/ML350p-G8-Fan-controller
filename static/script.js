@@ -3,9 +3,24 @@ let tempChart, fanChart;
 let fanSeriesInit = false;
 const maxPoints = 120; // ~10 minutes at 5s
 const fanHistory = {};
-const fanHistoryLimit = 24; // ~2 minutes of samples at 5s
-const trendHorizonSeconds = 30;
+const fanHistoryLimit = 36; // ~3 minutes of samples at 5s
+const trendHorizonSeconds = 60;
 let updateInProgress = false;
+let fanCurveConfig = null;
+const tempHistory = {
+  cpu: [],
+  gpu: [],
+};
+const predictDefaults = Object.freeze({
+  blend: 0.7,
+  gpuBlend: 0.75,
+  lead: 20,
+  slopeGain: 1.2,
+  maxOffset: 12,
+  gpuLead: 25,
+  gpuSlopeGain: 1.35,
+  gpuMaxOffset: 16,
+});
 
 const setUpdateInProgress = (state) => {
   updateInProgress = state;
@@ -91,11 +106,11 @@ const computeTrend = (points, horizonSeconds = trendHorizonSeconds) => {
   let effectiveHorizon = horizonSeconds;
   const recentDiff = points[n - 1].value - points[n - 2].value;
   const velocity = slope;
-  const volatility = signFlips >= 2 || maxJump >= 30 || Math.abs(recentDiff) >= 25;
+  const volatility = signFlips >= 2 || maxJump >= 35 || Math.abs(recentDiff) >= 30;
   if (volatility) {
-    effectiveHorizon = Math.max(5, Math.min(15, horizonSeconds / 2));
-  } else if (Math.abs(velocity) > 2.5) {
-    effectiveHorizon = Math.min(horizonSeconds, 20);
+    effectiveHorizon = Math.max(10, Math.min(25, horizonSeconds / 2));
+  } else if (Math.abs(velocity) > 1.8) {
+    effectiveHorizon = Math.min(horizonSeconds, 40);
   }
   let forecast = intercept + slope * (lastX + effectiveHorizon);
   if (!Number.isFinite(forecast)) return fallback();
@@ -106,23 +121,23 @@ const computeTrend = (points, horizonSeconds = trendHorizonSeconds) => {
   let icon = '→';
   let className = 'trend-flat';
   let roundDelta = Math.round(delta);
-  if (absDelta < 1.2) {
+  if (absDelta < 4.8) {
     delta = 0;
     roundDelta = 0;
     forecast = current;
-  } else if (delta >= 6) {
+  } else if (delta >= 10) {
     label = 'Spiking';
     icon = '⤴';
     className = 'trend-spike';
-  } else if (delta >= 2) {
+  } else if (delta >= 5) {
     label = 'Rising';
     icon = '↑';
     className = 'trend-up';
-  } else if (delta <= -6) {
+  } else if (delta <= -10) {
     label = 'Plunging';
     icon = '⤵';
     className = 'trend-plunge';
-  } else if (delta <= -2) {
+  } else if (delta <= -5) {
     label = 'Falling';
     icon = '↓';
     className = 'trend-down';
@@ -131,7 +146,7 @@ const computeTrend = (points, horizonSeconds = trendHorizonSeconds) => {
     label = 'Volatile';
     icon = '≈';
     className = 'trend-volatile';
-    const damped = Math.max(-10, Math.min(10, delta));
+    const damped = Math.max(-12, Math.min(12, delta));
     delta = damped;
     forecast = current + damped;
     roundDelta = Math.round(delta);
@@ -144,6 +159,121 @@ const computeTrend = (points, horizonSeconds = trendHorizonSeconds) => {
     icon,
     className,
     volatile: volatility
+  };
+};
+
+const computeTempForecast = (key, currentValue) => {
+  const history = tempHistory[key] || [];
+  if (!history || history.length < 3) {
+    return { forecast: currentValue, slope: 0 };
+  }
+  const base = history[0].t;
+  let sumX = 0;
+  let sumY = 0;
+  let sumXY = 0;
+  let sumXX = 0;
+  for (const p of history) {
+    const x = (p.t - base) / 1000;
+    const y = p.value;
+    sumX += x;
+    sumY += y;
+    sumXY += x * y;
+    sumXX += x * x;
+  }
+  const n = history.length;
+  const denom = n * sumXX - sumX * sumX;
+  if (Math.abs(denom) < 1e-6) {
+    return { forecast: currentValue, slope: 0 };
+  }
+  const slope = (n * sumXY - sumX * sumY) / denom;
+  const intercept = (sumY - slope * sumX) / n;
+  const lastX = (history[n - 1].t - base) / 1000;
+  const horizonSeconds = trendHorizonSeconds;
+  let forecast = intercept + slope * (lastX + horizonSeconds);
+  if (!Number.isFinite(forecast)) {
+    forecast = currentValue;
+  }
+  return {
+    forecast,
+    slope,
+  };
+};
+
+const mapTempToFanPercent = (temp, isGpu = false) => {
+  const cfg = parseFanCurveConfig();
+  if (!cfg) return null;
+  const segment = isGpu && cfg.gpu ? cfg.gpu : cfg;
+  const minTemp = parseFloat(segment.minTemp ?? cfg.minTemp ?? 30);
+  const maxTemp = parseFloat(segment.maxTemp ?? cfg.maxTemp ?? 80);
+  const minSpeed = parseFloat(segment.minSpeed ?? cfg.minSpeed ?? 20);
+  const maxSpeed = parseFloat(segment.maxSpeed ?? cfg.maxSpeed ?? 100);
+  if (!Number.isFinite(temp)) return null;
+  if (temp <= minTemp) return minSpeed;
+  if (temp >= maxTemp) return maxSpeed;
+  const ratio = (temp - minTemp) / (maxTemp - minTemp);
+  return minSpeed + ratio * (maxSpeed - minSpeed);
+};
+const parseFanCurveConfig = () => {
+  if (fanCurveConfig) return fanCurveConfig;
+  const script = document.getElementById('fanCurveData');
+  if (!script) return null;
+  try {
+    fanCurveConfig = JSON.parse(script.textContent || '{}');
+  } catch (err) {
+    fanCurveConfig = null;
+  }
+  return fanCurveConfig;
+};
+
+const pickNumeric = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+};
+
+const getPredictSetting = (key, fallback, isGpu = false) => {
+  const cfg = parseFanCurveConfig();
+  const predict = cfg && typeof cfg.predict === 'object' ? cfg.predict : null;
+  if (predict) {
+    if (isGpu) {
+      const gpuKey = `gpu${key.charAt(0).toUpperCase()}${key.slice(1)}`;
+      const gpuVal = pickNumeric(predict[gpuKey]);
+      if (gpuVal !== null) return gpuVal;
+    }
+    const baseVal = pickNumeric(predict[key]);
+    if (baseVal !== null) return baseVal;
+  }
+  return fallback;
+};
+
+const computePredictiveTemp = (key, current, forecast, slope) => {
+  const isGpu = key === 'gpu';
+  const blendFallback = isGpu && pickNumeric(predictDefaults.gpuBlend) !== null
+    ? predictDefaults.gpuBlend
+    : predictDefaults.blend;
+  const blendRaw = getPredictSetting('blend', blendFallback, isGpu);
+  const blend = Math.max(0, Math.min(1, blendRaw));
+  const leadDefault = isGpu ? predictDefaults.gpuLead : predictDefaults.lead;
+  const slopeGainDefault = isGpu ? predictDefaults.gpuSlopeGain : predictDefaults.slopeGain;
+  const offsetDefault = isGpu ? predictDefaults.gpuMaxOffset : predictDefaults.maxOffset;
+  const lead = getPredictSetting('lead', leadDefault, isGpu);
+  const slopeGain = getPredictSetting('slopeGain', slopeGainDefault, isGpu);
+  const maxOffset = Math.abs(getPredictSetting('maxOffset', offsetDefault, isGpu));
+  const currentValue = Number.isFinite(current) ? current : 0;
+  const forecastValue = Number.isFinite(forecast) ? forecast : currentValue;
+  const slopeValue = Number.isFinite(slope) ? slope : 0;
+  const effective = currentValue * (1 - blend) + forecastValue * blend;
+  const offsetRaw = slopeValue * lead * slopeGain;
+  const offset = Math.max(-maxOffset, Math.min(maxOffset, offsetRaw));
+  const aheadTemp = effective + offset;
+  return {
+    effective,
+    offset,
+    aheadTemp,
+    blend,
+    lead,
+    slope: slopeValue,
+    forecast: forecastValue,
   };
 };
 
@@ -202,6 +332,18 @@ function poll() {
       });
       const cpu = parseInt(data.cpu || '0', 10) || 0;
       const gpu = parseInt(data.gpu || '0', 10) || 0;
+      const nowTempTs = Date.now();
+      const tempKeys = [
+        { key: 'cpu', value: cpu },
+        { key: 'gpu', value: gpu },
+      ];
+      tempKeys.forEach(({ key, value }) => {
+        if (!tempHistory[key]) tempHistory[key] = [];
+        tempHistory[key].push({ t: nowTempTs, value });
+        if (tempHistory[key].length > fanHistoryLimit) {
+          tempHistory[key].splice(0, tempHistory[key].length - fanHistoryLimit);
+        }
+      });
       document.getElementById('cpu').innerText = data.cpu;
       document.getElementById('gpu').innerText = data.gpu;
       if (data.gpu_name) document.getElementById('gpu_name').innerText = `(${data.gpu_name})`;
@@ -266,6 +408,9 @@ function poll() {
         const pctWidth = Number.isNaN(pctNum) ? 0 : Math.max(0, Math.min(100, pctNum));
         valueSpan.textContent = `${pctWidth}%`;
         header.appendChild(valueSpan);
+        const advisory = document.createElement('div');
+        advisory.className = 'fan-advisory';
+        header.appendChild(advisory);
         li.appendChild(header);
         li.dataset.percent = pctWidth;
         const heatClass = pickHeatClass(pctWidth);
@@ -314,6 +459,29 @@ function poll() {
         if (trend.delta !== 0) {
           detailParts.push(`Δ${trendHorizonSeconds}s ${trend.delta > 0 ? '+' : ''}${trend.delta}%`);
         }
+        const groupLower = (group || '').toLowerCase();
+        const isGpuFan = fanId.toLowerCase().includes('gpu') || groupLower.includes('gpu') || fanId === 'fan4';
+        const sourceKey = isGpuFan ? 'gpu' : 'cpu';
+        const presentTemp = isGpuFan ? gpu : cpu;
+        const { forecast: rawForecastTemp, slope: tempSlope } = computeTempForecast(sourceKey, presentTemp);
+        const predictive = computePredictiveTemp(sourceKey, presentTemp, rawForecastTemp, tempSlope);
+        const targetSpeed = mapTempToFanPercent(predictive.aheadTemp, isGpuFan);
+        if (Number.isFinite(predictive.aheadTemp)) {
+          let forecastLine = `${sourceKey.toUpperCase()} ahead ${predictive.aheadTemp.toFixed(1)}°C`;
+          if (Number.isFinite(rawForecastTemp) && Math.abs(predictive.aheadTemp - rawForecastTemp) >= 0.2) {
+            forecastLine += ` (raw ${rawForecastTemp.toFixed(1)}°C)`;
+          }
+          detailParts.push(forecastLine);
+        }
+        if (Number.isFinite(predictive.offset) && Math.abs(predictive.offset) >= 0.1) {
+          detailParts.push(`Lead ${predictive.offset > 0 ? '+' : ''}${predictive.offset.toFixed(1)}°C`);
+        }
+        if (Number.isFinite(tempSlope) && Math.abs(tempSlope) >= 0.005) {
+          detailParts.push(`Slope ${(tempSlope * 60).toFixed(2)}°C/min`);
+        }
+        if (Number.isFinite(targetSpeed)) {
+          detailParts.push(`Projected fan ${Math.round(targetSpeed)}%`);
+        }
         const raw = bits[idx] ?? '';
         if (raw !== undefined && raw !== null && raw !== '') {
           detailParts.push(`raw ${raw}/255`);
@@ -325,7 +493,37 @@ function poll() {
         detail.className = 'fan-detail';
         detail.textContent = detailParts.join(' • ');
         li.appendChild(detail);
-        const shouldStrobe = pctWidth >= 92 || trend.forecast >= 95 || Math.abs(trend.delta) >= 12 || trend.volatile;
+        if (Number.isFinite(predictive.aheadTemp)) {
+          const diff = predictive.aheadTemp - presentTemp;
+          const tempPill = document.createElement('span');
+          tempPill.className = 'advisory-pill';
+          if (diff > 0.5) {
+            tempPill.textContent = `↑ +${diff.toFixed(1)}°C`;
+            tempPill.classList.add('advisory-warm');
+          } else if (diff < -0.5) {
+            tempPill.textContent = `↓ ${Math.abs(diff).toFixed(1)}°C`;
+            tempPill.classList.add('advisory-chill');
+          } else {
+            tempPill.textContent = '≈ steady';
+          }
+          advisory.appendChild(tempPill);
+          if (Number.isFinite(targetSpeed)) {
+            const targetPill = document.createElement('span');
+            targetPill.className = 'advisory-pill advisory-target';
+            targetPill.textContent = `→ ${Math.round(targetSpeed)}%`;
+            advisory.appendChild(targetPill);
+          }
+          if (Number.isFinite(predictive.offset) && Math.abs(predictive.offset) >= 0.3) {
+            const feedPill = document.createElement('span');
+            feedPill.className = 'advisory-pill advisory-feed';
+            feedPill.textContent = `${predictive.offset > 0 ? 'FF +' : 'FF '}${predictive.offset.toFixed(1)}°C`;
+            advisory.appendChild(feedPill);
+          }
+        }
+        if (!advisory.childElementCount) {
+          advisory.remove();
+        }
+        const shouldStrobe = pctWidth >= 92 || trend.forecast >= 97 || Math.abs(trend.delta) >= 15 || trend.volatile;
         if (shouldStrobe) {
           li.classList.add('strobe-active');
         } else {

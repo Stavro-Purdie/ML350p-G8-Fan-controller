@@ -5,6 +5,7 @@
   <title>Dynamic Fan Control</title>
   <link rel="stylesheet" href="/static/style.css">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script id="fanCurveData" type="application/json">{{ fan_curve | tojson | safe }}</script>
   <script src="/static/script.js"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" href="data:,">
@@ -118,6 +119,23 @@
       <label>Check Interval: <input type="number" name="checkInterval" value="{{ fan_curve.checkInterval or '' }}"> s</label>
       <label>Max Step: <input type="number" name="maxStep" value="{{ fan_curve.maxStep or '' }}"> %/tick</label>
       <label>Min Change: <input type="number" name="minChange" value="{{ fan_curve.minChange or '' }}"> %</label>
+    </fieldset>
+    <fieldset style="margin-top:10px;">
+      <legend>Predictive Control</legend>
+      <label>Horizon (s): <input type="number" min="5" name="predict_horizon" value="{{ fan_curve.predict.horizon }}"></label>
+      <label>History (samples): <input type="number" min="10" name="predict_history" value="{{ fan_curve.predict.history }}"></label>
+      <label>Min Points: <input type="number" min="3" name="predict_minPoints" value="{{ fan_curve.predict.minPoints }}"></label>
+      <label>Blend: <input type="number" step="0.05" min="0" max="1" name="predict_blend" value="{{ fan_curve.predict.blend }}"></label>
+      <label>GPU Blend: <input type="number" step="0.05" min="0" max="1" name="predict_gpuBlend" value="{{ fan_curve.predict.gpuBlend }}"></label>
+      <label>Lead (s): <input type="number" step="0.5" min="0" name="predict_lead" value="{{ fan_curve.predict.lead }}"></label>
+      <label>GPU Lead (s): <input type="number" step="0.5" min="0" name="predict_gpuLead" value="{{ fan_curve.predict.gpuLead }}"></label>
+      <label>Slope Gain: <input type="number" step="0.05" min="0" name="predict_slopeGain" value="{{ fan_curve.predict.slopeGain }}"></label>
+      <label>GPU Slope Gain: <input type="number" step="0.05" min="0" name="predict_gpuSlopeGain" value="{{ fan_curve.predict.gpuSlopeGain }}"></label>
+      <label>Max Offset (°C): <input type="number" step="0.5" min="0" name="predict_maxOffset" value="{{ fan_curve.predict.maxOffset }}"></label>
+      <label>GPU Max Offset (°C): <input type="number" step="0.5" min="0" name="predict_gpuMaxOffset" value="{{ fan_curve.predict.gpuMaxOffset }}"></label>
+      <label>Deadband (Δ%): <input type="number" min="0" name="predict_deadband" value="{{ fan_curve.predict.deadband }}"></label>
+      <label>GPU Deadband (Δ%): <input type="number" min="0" name="predict_gpuDeadband" value="{{ fan_curve.predict.gpuDeadband }}"></label>
+      <small style="grid-column: 1 / -1; color:#555;">Higher leads and gains increase anticipation, while larger deadbands reduce fan oscillation during idle periods.</small>
     </fieldset>
     <div style="margin-top:8px;"><button type="submit">Update Curve</button></div>
   </form>

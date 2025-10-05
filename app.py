@@ -11,8 +11,8 @@ FAN_SPEED_FILE = os.getenv("FAN_SPEED_FILE", "/opt/dynamic-fan-ui/fan_speeds.txt
 FAN_SPEED_BITS_FILE = os.getenv("FAN_SPEED_BITS_FILE", "/opt/dynamic-fan-ui/fan_speeds_bits.txt")
 UI_CONFIG_FILE = os.getenv("UI_CONFIG_FILE", "/opt/dynamic-fan-ui/ui_config.json")
 REPO_ROOT = os.getenv("REPO_ROOT", os.path.abspath(os.path.dirname(__file__)))
-# Self-update intentionally disabled by default; enable with SELF_UPDATE_ENABLED=1
-SELF_UPDATE_ENABLED = os.getenv("SELF_UPDATE_ENABLED", "0") == "1"
+# Self-update enabled by default; set SELF_UPDATE_ENABLED=0 to disable
+SELF_UPDATE_ENABLED = os.getenv("SELF_UPDATE_ENABLED", "1") == "1"
 SELF_UPDATE_REMOTE = os.getenv("SELF_UPDATE_REMOTE", "origin")
 SELF_UPDATE_BRANCH = os.getenv("SELF_UPDATE_BRANCH", "main")
 SELF_UPDATE_PRESERVE = [p.strip() for p in os.getenv("SELF_UPDATE_PRESERVE", "").split(",") if p.strip()]
@@ -117,6 +117,21 @@ def load_curve():
         "blend": {"mode": "max", "cpuWeight": 0.5, "gpuWeight": 0.5},
         "gpu": {"minTemp": "", "maxTemp": "", "minSpeed": "", "maxSpeed": ""},
         "gpuBoost": {"threshold": "", "add": 0},
+        "predict": {
+            "horizon": 45,
+            "history": 240,
+            "minPoints": 6,
+            "blend": 0.7,
+            "gpuBlend": 0.75,
+            "lead": 20,
+            "gpuLead": 25,
+            "slopeGain": 1.2,
+            "gpuSlopeGain": 1.35,
+            "maxOffset": 12,
+            "gpuMaxOffset": 16,
+            "deadband": 3,
+            "gpuDeadband": 4,
+        },
     }
     try:
         if os.path.exists(FAN_CURVE_FILE):
@@ -145,6 +160,25 @@ def load_curve():
     else:
         data["gpuBoost"].setdefault("threshold", "")
         data["gpuBoost"].setdefault("add", 0)
+    predict_defaults = {
+        "horizon": 45,
+        "history": 240,
+        "minPoints": 6,
+        "blend": 0.7,
+        "gpuBlend": 0.75,
+        "lead": 20,
+        "gpuLead": 25,
+        "slopeGain": 1.2,
+        "gpuSlopeGain": 1.35,
+        "maxOffset": 12,
+        "gpuMaxOffset": 16,
+        "deadband": 3,
+        "gpuDeadband": 4,
+    }
+    if not isinstance(data.get("predict"), dict):
+        data["predict"] = {}
+    for key, default in predict_defaults.items():
+        data["predict"].setdefault(key, default)
     return data
 
 
@@ -1264,6 +1298,46 @@ def update_curve():
             curve["maxStep"] = int(ms)
         if mc not in (None, ""):
             curve["minChange"] = int(mc)
+    except Exception:
+        pass
+    # Predictive control parameters
+    try:
+        predict = curve.get("predict")
+        if not isinstance(predict, dict):
+            predict = {}
+        int_fields = {
+            "predict_horizon": "horizon",
+            "predict_history": "history",
+            "predict_minPoints": "minPoints",
+            "predict_deadband": "deadband",
+            "predict_gpuDeadband": "gpuDeadband",
+        }
+        float_fields = {
+            "predict_blend": "blend",
+            "predict_gpuBlend": "gpuBlend",
+            "predict_slopeGain": "slopeGain",
+            "predict_gpuSlopeGain": "gpuSlopeGain",
+            "predict_maxOffset": "maxOffset",
+            "predict_gpuMaxOffset": "gpuMaxOffset",
+            "predict_lead": "lead",
+            "predict_gpuLead": "gpuLead",
+        }
+        for form_key, target in int_fields.items():
+            value = request.form.get(form_key)
+            if value not in (None, ""):
+                try:
+                    predict[target] = int(value)
+                except Exception:
+                    pass
+        for form_key, target in float_fields.items():
+            value = request.form.get(form_key)
+            if value not in (None, ""):
+                try:
+                    predict[target] = float(value)
+                except Exception:
+                    pass
+        if predict:
+            curve["predict"] = predict
     except Exception:
         pass
     try:
