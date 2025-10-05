@@ -20,14 +20,16 @@
 
   <h2>Fan Speeds</h2>
   <ul id="fan-speeds" class="meters">
+    {% if fan_categories and fan_categories|length > 0 %}
+      {% for category in fan_categories %}
         <li class="fan-category">
-          <div class="fan-category-title">{{ category.name }}</div>
+          <div class="fan-category-title">{{ category.name or 'Fans' }}</div>
           <ul class="fan-category-items">
             {% for item in category['items'] %}
               {% set idx = item.index if item.index is defined else loop.index0 %}
-              {% set label = item.label if item.label is defined else (fan_labels[idx] if fan_labels and fan_labels|length > idx else 'Fan ' ~ (idx + 1)) %}
-              {% set speed = item.speed if item.speed is defined else (fan_speeds[idx] if fan_speeds and fan_speeds|length > idx else 0) %}
               {% set fan_id = item.id if item.id is defined else ('fan' ~ (idx + 1)) %}
+              {% set label = item.label if item.label is defined else (fan_labels[idx] if fan_labels and fan_labels|length > idx else fan_id) %}
+              {% set speed = item.speed if item.speed is defined else (fan_speeds[idx] if fan_speeds and fan_speeds|length > idx else 0) %}
               <li class="fan-item fan-chill" data-percent="{{ speed }}" data-forecast="{{ speed }}" data-trend="flat">
                 <div class="fan-header">
                   <div class="fan-label">
@@ -49,15 +51,13 @@
             {% endfor %}
           </ul>
         </li>
-          </ul>
-        </li>
       {% endfor %}
     {% else %}
       {% for s in fan_speeds %}
         {% set idx = loop.index0 %}
-        <li class="fan-item fan-chill" data-percent="{{ s }}" data-forecast="{{ s }}" data-trend="flat">
+        {% set label = fan_labels[idx] if fan_labels and fan_labels|length > idx else 'Fan ' ~ (idx + 1) %}
         {% set group = fan_groups[idx] if fan_groups and fan_groups|length > idx else '' %}
-        <li class="fan-item" data-percent="{{ s }}" data-forecast="{{ s }}" data-trend="flat">
+        <li class="fan-item fan-chill" data-percent="{{ s }}" data-forecast="{{ s }}" data-trend="flat">
           <div class="fan-header">
             <div class="fan-label">
               {% if group %}<span class="fan-badge">{{ group }}</span>{% endif %}
@@ -65,14 +65,9 @@
               <span class="fan-id">fan{{ idx + 1 }}</span>
             </div>
             <div class="fan-value">{{ s }}%</div>
-            <div class="bar bar-chill" style="--initial-width: {{ s }}%;"></div>
-          <div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ s }}">
-          <div class="fan-trend">
-            <span class="trend-icon trend-flat">→</span>
-            <span class="trend-label">Stable</span>
-            <span class="trend-forecast">30s ≈ {{ s }}%</span>
           </div>
-            <div class="bar" style="width: {{ s }}%;"></div>
+          <div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ s }}">
+            <div class="bar bar-chill" style="--initial-width: {{ s }}%;"></div>
           </div>
           <div class="fan-trend">
             <span class="trend-icon trend-flat">→</span>
