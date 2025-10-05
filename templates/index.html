@@ -24,7 +24,7 @@
         <li class="fan-category">
           <div class="fan-category-title">{{ category.name }}</div>
           <ul class="fan-category-items">
-            {% for item in category.items %}
+            {% for item in category['items'] %}
               {% set idx = item.index if item.index is defined else loop.index0 %}
               {% set label = item.label if item.label is defined else (fan_labels[idx] if fan_labels and fan_labels|length > idx else 'Fan ' ~ (idx + 1)) %}
               {% set speed = item.speed if item.speed is defined else (fan_speeds[idx] if fan_speeds and fan_speeds|length > idx else '') %}
