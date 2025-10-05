@@ -9,7 +9,6 @@ ILO_USER="${ILO_USER:-admin}"
 ILO_SSH_KEY="${ILO_SSH_KEY:-/root/.ssh/ilo_key}"
 # Optional password auth (requires sshpass); leave empty to avoid using it
 ILO_PASSWORD="${ILO_PASSWORD:-}"
-USE_IPMI_TEMPS="${USE_IPMI_TEMPS:-0}"
 # Enable legacy SSH algorithms for older iLO (OpenSSH 8.8+ compatibility)
 ILO_SSH_LEGACY="${ILO_SSH_LEGACY:-0}"
 # Force modded mode fixed ON
@@ -215,19 +214,9 @@ fi
 
 # Function to read temps
 LAST_CPU_TS=0
-LAST_CPU_VAL=0
+LAST_CPU_VAL=35
 get_cpu_temp() {
-  if [[ "$USE_IPMI_TEMPS" == "1" && -n "$ILO_IP" && -n "$ILO_USER" ]]; then
-    if command -v ipmitool >/dev/null 2>&1; then
-      # Read highest CPU temperature via SDRs (fallback-friendly)
-      ipmitool -I lanplus -H "$ILO_IP" -U "$ILO_USER" ${ILO_PASSWORD:+-P "$ILO_PASSWORD"} sdr type Temperature \
-        | grep -Ei 'cpu|proc|processor' \
-        | sed -n -E 's/.*([0-9]{1,3})[ ]*[Cc]?.*/\1/p' \
-        | sort -nr | head -1
-      return
-    fi
-  fi
-  # Fallback to lm-sensors output (Package temperature)
+  # Read CPU temperature via lm-sensors output (Package temperature)
   if ! command -v sensors >/dev/null 2>&1; then
     echo "$LAST_CPU_VAL"
     return
@@ -239,22 +228,16 @@ get_cpu_temp() {
   local sensors_out
   sensors_out=$(sensors 2>/dev/null)
   local val pkg hottest
-  pkg=$(echo "$sensors_out" | awk '
-    /Package id/ {
-      if (match($0, /\+([0-9]+)(\.[0-9]+)?°C/, m)) {
-        print m[1]; exit
-      }
-    }')
+  pkg=$(printf "%s\n" "$sensors_out" | \
+    grep -i "Package id" | head -1 | \
+    grep -o '[0-9]\+' | head -1)
   if [[ -n "$pkg" ]]; then
     val=$pkg
   else
-    hottest=$(echo "$sensors_out" | awk '
-      {
-        if (match($0, /\+([0-9]+)(\.[0-9]+)?°C/, m)) {
-          if (m[1] + 0 > max) max = m[1] + 0
-        }
-      }
-      END { if (max > 0) print int(max); }')
+    hottest=$(printf "%s\n" "$sensors_out" | \
+      grep -oE '\+[0-9]+(\.[0-9]+)?°C' | \
+      tr -d '+°C' | cut -d'.' -f1 | \
+      sort -nr | head -1)
     [[ -n "$hottest" ]] && val=$hottest || val=""
   fi
   if [[ "$val" =~ ^[0-9]+$ ]]; then
@@ -262,7 +245,7 @@ get_cpu_temp() {
     LAST_CPU_TS=$now_ts
     echo "$val"
   else
-    echo "$LAST_CPU_VAL"
+    echo "${LAST_CPU_VAL:-35}"
   fi
 }
 

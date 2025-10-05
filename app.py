@@ -21,7 +21,7 @@ ILO_SSH_KEY = os.getenv("ILO_SSH_KEY", "/root/.ssh/ilo_key")
 ILO_USER = os.getenv("ILO_USER", "admin")
 ILO_IP = os.getenv("ILO_IP", "192.168.1.100")
 ILO_PASSWORD = os.getenv("ILO_PASSWORD", "")
-USE_IPMI_TEMPS = os.getenv("USE_IPMI_TEMPS", "0") == "1"
+USE_IPMI_TEMPS = False  # IPMI CPU temps disabled; sensors is authoritative
 ILO_SSH_LEGACY = os.getenv("ILO_SSH_LEGACY", "0") == "1"
 # Force modded mode fixed ON
 ILO_MODDED = True
@@ -272,7 +272,6 @@ def _ilo_worker():
             _ILO_QUEUE.task_done()
 
 threading.Thread(target=_ilo_worker, daemon=True).start()
-
 
 def _load_ui_config():
     try:
@@ -726,23 +725,9 @@ def _get_lm_sensors_summary() -> dict:
 
 def _load_additional_sensors() -> List[dict]:
     sensors: List[dict] = []
-    if USE_IPMI_TEMPS:
-        out = subprocess.check_output(
-            ["bash", "-lc", f"ipmitool -I lanplus -H {ILO_IP} -U {ILO_USER} {'-P '+ILO_PASSWORD if ILO_PASSWORD else ''} sdr type Temperature"],
-            text=True, timeout=3
-        )
-        for line in out.splitlines():
-            parts = [p.strip() for p in line.split('|')]
-            if len(parts) >= 2 and 'CPU' not in parts[0]:
-                m = re.search(r"(\d+)", parts[1])
-                if m:
-                    sensors.append({"label": parts[0], "value": m.group(1)})
-            if len(sensors) >= 5:
-                break
-    else:
-        summary = _get_lm_sensors_summary()
-        for item in summary.get("entries", [])[:6]:
-            sensors.append({"label": item.get("label", ""), "value": item.get("value", "")})
+    summary = _get_lm_sensors_summary()
+    for item in summary.get("entries", [])[:6]:
+        sensors.append({"label": item.get("label", ""), "value": item.get("value", "")})
     return sensors
 
 
@@ -763,35 +748,22 @@ def _get_service_status() -> dict:
 
 
 def get_temps():
-    cpu_temp = ""
-    if USE_IPMI_TEMPS:
-        try:
-            pw = f"-P {ILO_PASSWORD}" if ILO_PASSWORD else ""
-            cmd_str = (
-                f"ipmitool -I lanplus -H {ILO_IP} -U {ILO_USER} {pw} sdr type Temperature "
-                "| awk -F'|' '/CPU/ {{ if (match($2, /[0-9]+/, m)) print m[0]; }}' | sort -nr | head -1"
-            )
-            cmd = ["bash", "-lc", cmd_str]
-            cpu_temp = subprocess.check_output(cmd, text=True, timeout=3).strip()
-        except Exception:
-            cpu_temp = ""
+    summary = _get_lm_sensors_summary()
+    cpu_temp = summary.get("package", "") or ""
+    # As a fallback, reuse the hottest entry if package missing
     if not cpu_temp:
-        summary = _get_lm_sensors_summary()
-        cpu_temp = summary.get("package", "") or ""
-        # As a fallback, reuse the hottest entry if package missing
-        if not cpu_temp:
-            try:
-                entries = summary.get("entries", [])
-                hottest = 0
-                for item in entries:
-                    try:
-                        hottest = max(hottest, int(round(float(item.get("value", "0")))))
-                    except Exception:
-                        continue
-                if hottest > 0:
-                    cpu_temp = str(hottest)
-            except Exception:
-                pass
+        try:
+            entries = summary.get("entries", [])
+            hottest = 0
+            for item in entries:
+                try:
+                    hottest = max(hottest, int(round(float(item.get("value", "0")))))
+                except Exception:
+                    continue
+            if hottest > 0:
+                cpu_temp = str(hottest)
+        except Exception:
+            pass
     # Retain last non-zero CPU temp if we got an empty/zero reading
     try:
         global _LAST_CPU_TEMP
