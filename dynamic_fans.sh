@@ -1,4 +1,5 @@
 #!/bin/bash
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 # Dynamic fan controller for HP Gen8 + Tesla P40 with persistent fan speeds
 # Saves last speeds to /opt/dynamic-fan-ui/fan_speeds.txt
 
@@ -215,9 +216,14 @@ fi
 # Function to read temps
 LAST_CPU_TS=0
 LAST_CPU_VAL=35
+SENSORS_WARNED=0
 get_cpu_temp() {
   # Read CPU temperature via lm-sensors output (Package temperature)
   if ! command -v sensors >/dev/null 2>&1; then
+    if (( SENSORS_WARNED == 0 )); then
+      echo "ERROR: 'sensors' command not found in PATH ($PATH); install lm-sensors or adjust service environment." >&2
+      SENSORS_WARNED=1
+    fi
     echo "$LAST_CPU_VAL"
     return
   fi
@@ -228,16 +234,35 @@ get_cpu_temp() {
   local sensors_out
   sensors_out=$(sensors 2>/dev/null)
   local val pkg hottest
-  pkg=$(printf "%s\n" "$sensors_out" | \
-    grep -i "Package id" | head -1 | \
-    grep -o '[0-9]\+' | head -1)
+  pkg=$(printf "%s\n" "$sensors_out" | awk '
+    BEGIN { pkg="" }
+    /Package id/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /\+[0-9]/) {
+          val = $i
+          gsub(/[^0-9]/, "", val)
+          if (val != "") { pkg = val; exit }
+        }
+      }
+    }
+    END { if (pkg != "") print pkg }
+  ')
   if [[ -n "$pkg" ]]; then
     val=$pkg
   else
-    hottest=$(printf "%s\n" "$sensors_out" | \
-      grep -oE '\+[0-9]+(\.[0-9]+)?°C' | \
-      tr -d '+°C' | cut -d'.' -f1 | \
-      sort -nr | head -1)
+    hottest=$(printf "%s\n" "$sensors_out" | awk '
+      BEGIN { max = 0 }
+      /\+[0-9]/ {
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /\+[0-9]/) {
+            temp = $i
+            gsub(/[^0-9]/, "", temp)
+            if (temp+0 > max) { max = temp+0 }
+          }
+        }
+      }
+      END { if (max > 0) print int(max) }
+    ')
     [[ -n "$hottest" ]] && val=$hottest || val=""
   fi
   if [[ "$val" =~ ^[0-9]+$ ]]; then
