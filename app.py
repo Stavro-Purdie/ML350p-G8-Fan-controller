@@ -1,7 +1,7 @@
 from flask import Flask, render_template, request, redirect, jsonify
 import json, os, subprocess, re, time, threading, shutil, tempfile, shlex
 from collections import deque
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, Set
 
 app = Flask(__name__)
 
@@ -625,28 +625,6 @@ def _ilo_try(cmd: str, attempts: int = 2, timeout: Optional[int] = None, priorit
     return ""
 
 
-def _parse_fans_show(out: str) -> Dict[str, int]:
-    result: Dict[str, int] = {}
-    if not out:
-        return result
-    for line in out.splitlines():
-        lower = line.lower()
-        m = re.search(r"fan\s*([0-9]+)", lower)
-        if not m:
-            continue
-        fan = f"fan{m.group(1)}"
-        m_pct = re.search(r"(\d{1,3})\s*%", line)
-        if not m_pct:
-            continue
-        try:
-            val = int(m_pct.group(1))
-        except Exception:
-            continue
-        if 0 <= val <= 100:
-            result[fan] = val
-    return result
-
-
 def _trigger_ilo_actuals_refresh(force: bool = False):
     global _ILO_ACTUALS_REFRESHING
     now = time.time()
@@ -675,44 +653,28 @@ def _trigger_ilo_actuals_refresh(force: bool = False):
                     fans = FAN_IDS
             except Exception:
                 fans = FAN_IDS
-            missing = list(fans)
-            try:
-                combined = _parse_fans_show(_ilo_run("fans show", timeout=6, priority=priority))
-            except Exception:
-                combined = {}
-            if combined:
-                for fan, val in combined.items():
-                    actuals_map[fan] = val
-                    if fan in missing:
-                        try:
-                            missing.remove(fan)
-                        except ValueError:
-                            pass
             gap = max(1.0, ILO_CMD_GAP_MS / 1000.0)
-            for idx, fan in enumerate(missing):
-                try:
-                    if idx > 0:
-                        time.sleep(gap)
-                    out = _ilo_run(f"show /system1/{fan}", timeout=5, priority=priority)
-                except Exception:
+            queried = 0
+            seen_fans: Set[str] = set()
+            for raw_fan in fans:
+                fan = str(raw_fan).strip().lower()
+                if not fan:
                     continue
-                val = None
-                for line in out.splitlines():
-                    if ('=' in line) or (':' in line):
-                        parts = re.split(r"[:=]", line, maxsplit=1)
-                        if len(parts) < 2:
-                            continue
-                        key = parts[0].strip().lower()
-                        if any(k in key for k in ("speed","pwm","duty","duty_cycle","fan_speed","percentage")):
-                            m = re.search(r"(\d{1,3})", parts[1])
-                            if m:
-                                try:
-                                    n = int(m.group(1))
-                                    if 0 <= n <= 100:
-                                        val = n
-                                        break
-                                except Exception:
-                                    pass
+                if fan in seen_fans:
+                    continue
+                seen_fans.add(fan)
+                if queried > 0:
+                    time.sleep(gap)
+                queried += 1
+                val: Optional[int] = None
+                for path in _fan_show_paths(fan):
+                    try:
+                        out = _ilo_run(f"show {path}", timeout=5, priority=priority)
+                    except Exception:
+                        continue
+                    val = _parse_fan_percentage(out)
+                    if val is not None:
+                        break
                 if val is not None:
                     actuals_map[fan] = val
             with _ILO_ACTUALS_LOCK:
@@ -731,22 +693,15 @@ def _discover_fans() -> List[str]:
         if _DISCOVERED_FANS is not None:
             return _DISCOVERED_FANS
         found: List[str] = []
-        # Prefer concise 'fans show' listing if available
-        try:
-            out = _ilo_run("fans show", priority=8)
-            toks = re.findall(r"\bfan\d+\b", out.lower())
-            if toks:
-                _DISCOVERED_FANS = sorted(set(toks), key=lambda x: int(re.findall(r"\d+", x)[0]))
-                return _DISCOVERED_FANS
-        except Exception:
-            pass
+        # 'fans show' is intentionally avoided; rely on broader object listings instead
         for p in FAN_PATHS:
             try:
                 out = _ilo_run(f"show {p}", priority=8)
             except Exception:
                 continue
             # Find tokens like fan1 fan2
-            tokens = re.findall(r"\bfan\d+\b", out)
+            out_lower = out.lower()
+            tokens = re.findall(r"\bfan\d+\b", out_lower)
             if tokens:
                 found = sorted(set(tokens), key=lambda x: int(re.findall(r"\d+", x)[0]))
                 _DISCOVERED_FANS = found
@@ -754,6 +709,45 @@ def _discover_fans() -> List[str]:
         # fallback to configured list (clamped to three fans by FAN_IDS)
         _DISCOVERED_FANS = FAN_IDS[:]
         return _DISCOVERED_FANS
+
+
+def _fan_show_paths(fan: str) -> List[str]:
+    token = re.sub(r"[^a-z0-9]", "", str(fan).strip().lower())
+    if not token:
+        token = "fan"
+    if not token.startswith("fan"):
+        digits = re.findall(r"\d+", token)
+        if digits:
+            token = f"fan{digits[-1]}"
+        else:
+            token = f"fan{token}"
+    bases = list(dict.fromkeys([p.rstrip("/") or "/" for p in FAN_PATHS] + ["/system1"]))
+    paths: List[str] = []
+    for base in bases:
+        base_norm = base if base.startswith("/") else f"/{base}"
+        path = re.sub(r"/+", "/", f"{base_norm}/{token}")
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _parse_fan_percentage(out: str) -> Optional[int]:
+    for line in out.splitlines():
+        if ('=' in line) or (':' in line):
+            parts = re.split(r"[:=]", line, maxsplit=1)
+            if len(parts) < 2:
+                continue
+            key = parts[0].strip().lower()
+            if any(k in key for k in ("speed", "pwm", "duty", "duty_cycle", "fan_speed", "percentage")):
+                m = re.search(r"(\d{1,3})", parts[1])
+                if m:
+                    try:
+                        n = int(m.group(1))
+                    except Exception:
+                        continue
+                    if 0 <= n <= 100:
+                        return n
+    return None
 
 
 def _detect_fan_prop() -> Tuple[Optional[str], Optional[str]]:
