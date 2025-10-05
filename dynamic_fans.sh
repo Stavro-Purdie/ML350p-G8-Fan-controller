@@ -535,18 +535,18 @@ while true; do
   [[ "$CPU_TEMP" =~ ^[0-9]+$ ]] || CPU_TEMP=0
   [[ "$GPU_TEMP" =~ ^[0-9]+$ ]] || GPU_TEMP=0
   read CPU_TARGET GPU_TARGET < <(calc_targets "$CPU_TEMP" "$GPU_TEMP")
-  # Determine target for system fans (fan2, fan3)
-  SYSTEM_MODE="max"
-  SYS_CW="0.5"
-  SYS_GW="0.5"
+  # Determine target for system fans (fan2, fan3) — default to CPU only
+  SYSTEM_MODE="cpu"
+  SYS_CW="1"
+  SYS_GW="0"
   if command -v jq >/dev/null 2>&1; then
-    SYSTEM_MODE=$(jq -r '(.systemFans.mode // .blend.mode // "max")' "$FAN_CURVE_FILE" 2>/dev/null | tr 'A-Z' 'a-z')
-    SYS_CW=$(jq -r '(.systemFans.cpuWeight // .blend.cpuWeight // 0.5)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.5)
-    SYS_GW=$(jq -r '(.systemFans.gpuWeight // .blend.gpuWeight // 0.5)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.5)
+    SYSTEM_MODE=$(jq -r '(.systemFans.mode // "")' "$FAN_CURVE_FILE" 2>/dev/null | tr 'A-Z' 'a-z')
+    SYS_CW=$(jq -r '(.systemFans.cpuWeight // "")' "$FAN_CURVE_FILE" 2>/dev/null || echo "")
+    SYS_GW=$(jq -r '(.systemFans.gpuWeight // "")' "$FAN_CURVE_FILE" 2>/dev/null || echo "")
   fi
-  [[ -z "$SYSTEM_MODE" || "$SYSTEM_MODE" == "null" ]] && SYSTEM_MODE="max"
-  [[ "$SYS_CW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || SYS_CW="0.5"
-  [[ "$SYS_GW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || SYS_GW="0.5"
+  [[ -z "$SYSTEM_MODE" || "$SYSTEM_MODE" == "null" ]] && SYSTEM_MODE="cpu"
+  [[ "$SYS_CW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || SYS_CW="1"
+  [[ "$SYS_GW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || SYS_GW="0"
   case "$SYSTEM_MODE" in
     cpu)
       SYSTEM_TARGET=$CPU_TARGET
@@ -572,54 +572,23 @@ while true; do
       fi
       ;;
     max|*)
-      SYSTEM_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
+      SYSTEM_TARGET=$CPU_TARGET
       ;;
   esac
 
-  # Dedicated GPU fan control (fan4)
-  GPU_MODE="gpu"
-  GPU_CW="0.25"
-  GPU_GW="0.75"
+  # Dedicated GPU fan control (fan4) — isolate to GPU metrics only
   GPU_OFFSET="0"
   GPU_MIN=""
   GPU_MAX=""
   if command -v jq >/dev/null 2>&1; then
-    GPU_MODE=$(jq -r '(.gpuFan.mode // .perFan.fan4.mode // "gpu")' "$FAN_CURVE_FILE" 2>/dev/null | tr 'A-Z' 'a-z')
-    GPU_CW=$(jq -r '(.gpuFan.cpuWeight // .perFan.fan4.cpuWeight // 0.25)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.25)
-    GPU_GW=$(jq -r '(.gpuFan.gpuWeight // .perFan.fan4.gpuWeight // 0.75)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0.75)
     GPU_OFFSET=$(jq -r '(.gpuFan.offset // .perFan.fan4.offset // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
     GPU_MIN=$(jq -r '(.gpuFan.min // .perFan.fan4.min // empty)' "$FAN_CURVE_FILE" 2>/dev/null || echo "")
     GPU_MAX=$(jq -r '(.gpuFan.max // .perFan.fan4.max // empty)' "$FAN_CURVE_FILE" 2>/dev/null || echo "")
   fi
-  [[ -z "$GPU_MODE" || "$GPU_MODE" == "null" ]] && GPU_MODE="gpu"
-  [[ "$GPU_CW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || GPU_CW="0.25"
-  [[ "$GPU_GW" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || GPU_GW="0.75"
   [[ "$GPU_OFFSET" =~ ^-?[0-9]+$ ]] || GPU_OFFSET="0"
   [[ "$GPU_MIN" =~ ^-?[0-9]+$ ]] || GPU_MIN=""
   [[ "$GPU_MAX" =~ ^-?[0-9]+$ ]] || GPU_MAX=""
-  case "$GPU_MODE" in
-    cpu)
-      GPU_FAN_TARGET=$CPU_TARGET
-      ;;
-    max)
-      GPU_FAN_TARGET=$(( CPU_TARGET > GPU_TARGET ? CPU_TARGET : GPU_TARGET ))
-      ;;
-    weighted|gpu-weighted|default)
-      if command -v awk >/dev/null 2>&1; then
-        weighted=$(awk -v c="$CPU_TARGET" -v g="$GPU_TARGET" -v cw="$GPU_CW" -v gw="$GPU_GW" 'BEGIN{sum=cw+gw; if(sum<=0){ best=(g>c?g:c); } else { best=(c*cw + g*gw)/sum; } if(best<0)best=0; if(best>100)best=100; printf("%d\n", int(best+0.5)); }')
-        if [[ "$weighted" =~ ^[0-9]+$ ]]; then
-          GPU_FAN_TARGET=$weighted
-        else
-          GPU_FAN_TARGET=$GPU_TARGET
-        fi
-      else
-        GPU_FAN_TARGET=$GPU_TARGET
-      fi
-      ;;
-    gpu|gpu_only|*)
-      GPU_FAN_TARGET=$GPU_TARGET
-      ;;
-  esac
+  GPU_FAN_TARGET=$GPU_TARGET
   if [[ "$GPU_OFFSET" =~ ^-?[0-9]+$ ]]; then
     GPU_FAN_TARGET=$(( GPU_FAN_TARGET + GPU_OFFSET ))
   fi
@@ -638,7 +607,6 @@ while true; do
   GB_T=$(jq -r '(.gpuBoost.threshold // empty)' "$FAN_CURVE_FILE" 2>/dev/null || true)
   GB_A=$(jq -r '(.gpuBoost.add // 0)' "$FAN_CURVE_FILE" 2>/dev/null || echo 0)
   if [[ -n "$GB_T" && "$GB_T" =~ ^[0-9]+$ && "$GPU_TEMP" -ge "$GB_T" ]]; then
-    SYSTEM_TARGET=$(( SYSTEM_TARGET + GB_A ))
     GPU_FAN_TARGET=$(( GPU_FAN_TARGET + GB_A ))
   fi
   (( SYSTEM_TARGET < 0 )) && SYSTEM_TARGET=0
