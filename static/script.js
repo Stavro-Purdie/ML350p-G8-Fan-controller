@@ -26,6 +26,15 @@ const predictDefaults = Object.freeze({
   gpuLead: 25,
   gpuSlopeGain: 1.35,
   gpuMaxOffset: 16,
+  window: 60,
+  rateGain: 5,
+  gpuRateGain: 6,
+  rateDeadband: 0.2,
+  gpuRateDeadband: 0.25,
+  rateMax: 30,
+  gpuRateMax: 35,
+  rateCooldown: 0.4,
+  gpuRateCooldown: 0.35,
 });
 
 const setUpdateInProgress = (state) => {

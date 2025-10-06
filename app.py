@@ -124,6 +124,7 @@ def load_curve():
             "horizon": 45,
             "history": 240,
             "minPoints": 6,
+            "window": 60,
             "blend": 0.7,
             "gpuBlend": 0.75,
             "lead": 20,
@@ -134,6 +135,14 @@ def load_curve():
             "gpuMaxOffset": 16,
             "deadband": 3,
             "gpuDeadband": 4,
+            "rateGain": 5,
+            "gpuRateGain": 6,
+            "rateDeadband": 0.2,
+            "gpuRateDeadband": 0.25,
+            "rateMax": 30,
+            "gpuRateMax": 35,
+            "rateCooldown": 0.4,
+            "gpuRateCooldown": 0.35,
         },
     }
     try:
@@ -167,6 +176,7 @@ def load_curve():
         "horizon": 45,
         "history": 240,
         "minPoints": 6,
+    "window": 60,
         "blend": 0.7,
         "gpuBlend": 0.75,
         "lead": 20,
@@ -177,6 +187,14 @@ def load_curve():
         "gpuMaxOffset": 16,
         "deadband": 3,
         "gpuDeadband": 4,
+        "rateGain": 5,
+        "gpuRateGain": 6,
+        "rateDeadband": 0.2,
+        "gpuRateDeadband": 0.25,
+        "rateMax": 30,
+        "gpuRateMax": 35,
+        "rateCooldown": 0.4,
+        "gpuRateCooldown": 0.35,
     }
     if not isinstance(data.get("predict"), dict):
         data["predict"] = {}
@@ -1344,6 +1362,7 @@ def update_curve():
             "predict_horizon": "horizon",
             "predict_history": "history",
             "predict_minPoints": "minPoints",
+            "predict_window": "window",
             "predict_deadband": "deadband",
             "predict_gpuDeadband": "gpuDeadband",
         }
@@ -1356,6 +1375,14 @@ def update_curve():
             "predict_gpuMaxOffset": "gpuMaxOffset",
             "predict_lead": "lead",
             "predict_gpuLead": "gpuLead",
+            "predict_rateGain": "rateGain",
+            "predict_gpuRateGain": "gpuRateGain",
+            "predict_rateDeadband": "rateDeadband",
+            "predict_gpuRateDeadband": "gpuRateDeadband",
+            "predict_rateMax": "rateMax",
+            "predict_gpuRateMax": "gpuRateMax",
+            "predict_rateCooldown": "rateCooldown",
+            "predict_gpuRateCooldown": "gpuRateCooldown",
         }
         for form_key, target in int_fields.items():
             value = request.form.get(form_key)

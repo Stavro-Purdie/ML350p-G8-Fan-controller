@@ -125,6 +125,7 @@
       <label>Horizon (s): <input type="number" min="5" name="predict_horizon" value="{{ fan_curve.predict.horizon }}"></label>
       <label>History (samples): <input type="number" min="10" name="predict_history" value="{{ fan_curve.predict.history }}"></label>
       <label>Min Points: <input type="number" min="3" name="predict_minPoints" value="{{ fan_curve.predict.minPoints }}"></label>
+      <label>Window (samples): <input type="number" min="5" name="predict_window" value="{{ fan_curve.predict.window }}"></label>
       <label>Blend: <input type="number" step="0.05" min="0" max="1" name="predict_blend" value="{{ fan_curve.predict.blend }}"></label>
       <label>GPU Blend: <input type="number" step="0.05" min="0" max="1" name="predict_gpuBlend" value="{{ fan_curve.predict.gpuBlend }}"></label>
       <label>Lead (s): <input type="number" step="0.5" min="0" name="predict_lead" value="{{ fan_curve.predict.lead }}"></label>
@@ -135,7 +136,16 @@
       <label>GPU Max Offset (°C): <input type="number" step="0.5" min="0" name="predict_gpuMaxOffset" value="{{ fan_curve.predict.gpuMaxOffset }}"></label>
       <label>Deadband (Δ%): <input type="number" min="0" name="predict_deadband" value="{{ fan_curve.predict.deadband }}"></label>
       <label>GPU Deadband (Δ%): <input type="number" min="0" name="predict_gpuDeadband" value="{{ fan_curve.predict.gpuDeadband }}"></label>
+      <label>Rate Gain (%/°C·min): <input type="number" step="0.1" name="predict_rateGain" value="{{ fan_curve.predict.rateGain }}"></label>
+      <label>GPU Rate Gain (%/°C·min): <input type="number" step="0.1" name="predict_gpuRateGain" value="{{ fan_curve.predict.gpuRateGain }}"></label>
+      <label>Rate Deadband (°C/min): <input type="number" step="0.05" min="0" name="predict_rateDeadband" value="{{ fan_curve.predict.rateDeadband }}"></label>
+      <label>GPU Rate Deadband (°C/min): <input type="number" step="0.05" min="0" name="predict_gpuRateDeadband" value="{{ fan_curve.predict.gpuRateDeadband }}"></label>
+      <label>Rate Max (Δ%): <input type="number" step="1" min="0" name="predict_rateMax" value="{{ fan_curve.predict.rateMax }}"></label>
+      <label>GPU Rate Max (Δ%): <input type="number" step="1" min="0" name="predict_gpuRateMax" value="{{ fan_curve.predict.gpuRateMax }}"></label>
+      <label>Rate Cooldown: <input type="number" step="0.05" min="0" max="1" name="predict_rateCooldown" value="{{ fan_curve.predict.rateCooldown }}"></label>
+      <label>GPU Rate Cooldown: <input type="number" step="0.05" min="0" max="1" name="predict_gpuRateCooldown" value="{{ fan_curve.predict.gpuRateCooldown }}"></label>
       <small style="grid-column: 1 / -1; color:#555;">Higher leads and gains increase anticipation, while larger deadbands reduce fan oscillation during idle periods.</small>
+      <small style="grid-column: 1 / -1; color:#555;">Rate gains react to °C/min changes: positive rates boost fans immediately, while cooldown softens reductions during cooldown.</small>
     </fieldset>
     <div style="margin-top:8px;"><button type="submit">Update Curve</button></div>
   </form>

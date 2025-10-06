@@ -111,19 +111,28 @@ FAN_SPEED_BITS_FILE="${FAN_SPEED_BITS_FILE:-/opt/dynamic-fan-ui/fan_speeds_bits.
 FAN_CURVE_FILE="${FAN_CURVE_FILE:-/opt/dynamic-fan-ui/fan_curve.json}"
 PWM_UNITS="${PWM_UNITS:-bits}"
 
-PREDICT_HISTORY="${PREDICT_HISTORY:-240}"
-PREDICT_MIN_POINTS="${PREDICT_MIN_POINTS:-6}"
-PREDICT_HORIZON="${PREDICT_HORIZON:-45}"
-PREDICT_BLEND="${PREDICT_BLEND:-0.7}"
-PREDICT_GPU_BLEND="${PREDICT_GPU_BLEND:-0.75}"
-PREDICT_DEADBAND="${PREDICT_DEADBAND:-3}"
-PREDICT_GPU_DEADBAND="${PREDICT_GPU_DEADBAND:-4}"
-PREDICT_LEAD="${PREDICT_LEAD:-20}"
-PREDICT_GPU_LEAD="${PREDICT_GPU_LEAD:-25}"
-PREDICT_SLOPE_GAIN="${PREDICT_SLOPE_GAIN:-1.2}"
-PREDICT_GPU_SLOPE_GAIN="${PREDICT_GPU_SLOPE_GAIN:-1.35}"
-PREDICT_MAX_OFFSET="${PREDICT_MAX_OFFSET:-12}"
-PREDICT_GPU_MAX_OFFSET="${PREDICT_GPU_MAX_OFFSET:-16}"
+PREDICT_HISTORY="${PREDICT_HISTORY:-180}"
+PREDICT_WINDOW="${PREDICT_WINDOW:-60}"
+PREDICT_MIN_POINTS="${PREDICT_MIN_POINTS:-4}"
+PREDICT_HORIZON="${PREDICT_HORIZON:-20}"
+PREDICT_BLEND="${PREDICT_BLEND:-0.45}"
+PREDICT_GPU_BLEND="${PREDICT_GPU_BLEND:-0.55}"
+PREDICT_DEADBAND="${PREDICT_DEADBAND:-1}"
+PREDICT_GPU_DEADBAND="${PREDICT_GPU_DEADBAND:-1}"
+PREDICT_LEAD="${PREDICT_LEAD:-8}"
+PREDICT_GPU_LEAD="${PREDICT_GPU_LEAD:-10}"
+PREDICT_SLOPE_GAIN="${PREDICT_SLOPE_GAIN:-0.6}"
+PREDICT_GPU_SLOPE_GAIN="${PREDICT_GPU_SLOPE_GAIN:-0.7}"
+PREDICT_MAX_OFFSET="${PREDICT_MAX_OFFSET:-6}"
+PREDICT_GPU_MAX_OFFSET="${PREDICT_GPU_MAX_OFFSET:-7}"
+PREDICT_RATE_GAIN="${PREDICT_RATE_GAIN:-4}"
+PREDICT_GPU_RATE_GAIN="${PREDICT_GPU_RATE_GAIN:-5}"
+PREDICT_RATE_DEADBAND="${PREDICT_RATE_DEADBAND:-0.15}"
+PREDICT_GPU_RATE_DEADBAND="${PREDICT_GPU_RATE_DEADBAND:-0.2}"
+PREDICT_RATE_MAX="${PREDICT_RATE_MAX:-25}"
+PREDICT_GPU_RATE_MAX="${PREDICT_GPU_RATE_MAX:-30}"
+PREDICT_RATE_COOLDOWN="${PREDICT_RATE_COOLDOWN:-0.5}"
+PREDICT_GPU_RATE_COOLDOWN="${PREDICT_GPU_RATE_COOLDOWN:-0.4}"
 
 declare -a CPU_HISTORY=()
 declare -a GPU_HISTORY=()
@@ -153,7 +162,11 @@ forecast_temp() {
     return
   fi
   local result
-  result=$(printf '%s\n' "${arr[@]}" | awk -F':' -v horizon="$horizon" -v fallback="$fallback" -v min="$PREDICT_MIN_POINTS" '
+  local tail_cmd=(cat)
+  if (( PREDICT_WINDOW > 0 && len > PREDICT_WINDOW )); then
+    tail_cmd=(tail -n "$PREDICT_WINDOW")
+  fi
+  result=$(printf '%s\n' "${arr[@]}" | "${tail_cmd[@]}" | awk -F':' -v horizon="$horizon" -v fallback="$fallback" -v min="$PREDICT_MIN_POINTS" '
     NF < 2 { next }
     {
       if (count == 0) base = $1
@@ -243,6 +256,48 @@ lead_adjust() {
   }')
   [[ -z "$offset" ]] && offset=0
   printf '%s\n' "$offset"
+}
+
+rate_adjust() {
+  local rate=$1 gain=${2:-$PREDICT_RATE_GAIN} max_adj=${3:-$PREDICT_RATE_MAX} dead=${4:-$PREDICT_RATE_DEADBAND} cooldown=${5:-$PREDICT_RATE_COOLDOWN}
+  if [[ ! "$rate" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    printf '0\n'
+    return
+  fi
+  if [[ ! "$gain" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    gain=$PREDICT_RATE_GAIN
+  fi
+  if [[ ! "$max_adj" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    max_adj=$PREDICT_RATE_MAX
+  fi
+  if [[ ! "$dead" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    dead=$PREDICT_RATE_DEADBAND
+  fi
+  if [[ ! "$cooldown" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    cooldown=$PREDICT_RATE_COOLDOWN
+  fi
+  local adj
+  adj=$(awk -v rate="$rate" -v gain="$gain" -v maxa="$max_adj" -v dead="$dead" -v cool="$cooldown" 'BEGIN {
+    if (maxa < 0) maxa = -maxa;
+    if (dead < 0) dead = -dead;
+    if (cool < 0) cool = -cool;
+    absRate = rate;
+    if (absRate < 0) absRate = -absRate;
+    if (absRate <= dead) {
+      printf("0\n");
+      exit;
+    }
+    eff = absRate - dead;
+    if (rate < 0 && cool > 0 && cool < 1) {
+      eff = eff * (1 - cool);
+    }
+    val = (rate >= 0 ? eff : -eff) * gain;
+    if (val > maxa) val = maxa;
+    if (val < -maxa) val = -maxa;
+    printf("%.2f\n", val);
+  }')
+  [[ -z "$adj" ]] && adj=0
+  printf '%s\n' "$adj"
 }
 
 declare -A LAST_SPEEDS
@@ -357,7 +412,15 @@ cat > "$FAN_CURVE_FILE" <<EOF
     "maxOffset": 12,
     "gpuMaxOffset": 16,
     "deadband": 3,
-    "gpuDeadband": 4
+    "gpuDeadband": 4,
+    "rateGain": 5,
+    "gpuRateGain": 6,
+    "rateDeadband": 0.2,
+    "gpuRateDeadband": 0.25,
+    "rateMax": 30,
+    "gpuRateMax": 35,
+    "rateCooldown": 0.4,
+    "gpuRateCooldown": 0.35
   }
 }
 EOF
@@ -692,12 +755,16 @@ while true; do
   [[ -z "$CPU_SLOPE" ]] && CPU_SLOPE="0"
   [[ -z "$GPU_FORECAST" ]] && GPU_FORECAST=$GPU_TEMP
   [[ -z "$GPU_SLOPE" ]] && GPU_SLOPE="0"
+  CPU_RATE_PER_MIN=$(awk -v s="$CPU_SLOPE" 'BEGIN { printf("%.4f\n", s * 60.0); }')
+  GPU_RATE_PER_MIN=$(awk -v s="$GPU_SLOPE" 'BEGIN { printf("%.4f\n", s * 60.0); }')
   CPU_EFFECTIVE=$(blend_temp "$CPU_TEMP" "$CPU_FORECAST" "$PREDICT_BLEND")
   GPU_EFFECTIVE=$(blend_temp "$GPU_TEMP" "$GPU_FORECAST" "$PREDICT_GPU_BLEND")
   [[ -z "$CPU_EFFECTIVE" ]] && CPU_EFFECTIVE=$CPU_TEMP
   [[ -z "$GPU_EFFECTIVE" ]] && GPU_EFFECTIVE=$GPU_TEMP
   CPU_FEED_OFFSET=$(lead_adjust "$CPU_SLOPE" "$PREDICT_LEAD" "$PREDICT_SLOPE_GAIN" "$PREDICT_MAX_OFFSET")
   GPU_FEED_OFFSET=$(lead_adjust "$GPU_SLOPE" "$PREDICT_GPU_LEAD" "$PREDICT_GPU_SLOPE_GAIN" "$PREDICT_GPU_MAX_OFFSET")
+  CPU_RATE_GAINED=$(rate_adjust "$CPU_RATE_PER_MIN" "$PREDICT_RATE_GAIN" "$PREDICT_RATE_MAX" "$PREDICT_RATE_DEADBAND" "$PREDICT_RATE_COOLDOWN")
+  GPU_RATE_GAINED=$(rate_adjust "$GPU_RATE_PER_MIN" "$PREDICT_GPU_RATE_GAIN" "$PREDICT_GPU_RATE_MAX" "$PREDICT_GPU_RATE_DEADBAND" "$PREDICT_GPU_RATE_COOLDOWN")
   CPU_EFFECTIVE_AHEAD=$(awk -v base="$CPU_EFFECTIVE" -v off="$CPU_FEED_OFFSET" 'BEGIN { printf("%.2f\n", base + off); }')
   GPU_EFFECTIVE_AHEAD=$(awk -v base="$GPU_EFFECTIVE" -v off="$GPU_FEED_OFFSET" 'BEGIN { printf("%.2f\n", base + off); }')
   if [[ "$CPU_EFFECTIVE_AHEAD" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
@@ -751,6 +818,11 @@ while true; do
       SYSTEM_TARGET=$CPU_TARGET
       ;;
   esac
+  if [[ "$CPU_RATE_GAINED" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    CPU_RATE_DELTA=$(awk -v v="$CPU_RATE_GAINED" 'BEGIN { if (!(v == v)) { print 0; exit } if (v >= 0) { printf("%d\n", int(v + 0.5)); } else { printf("%d\n", int(v - 0.5)); } }')
+    [[ -z "$CPU_RATE_DELTA" ]] && CPU_RATE_DELTA=0
+    SYSTEM_TARGET=$(( SYSTEM_TARGET + CPU_RATE_DELTA ))
+  fi
 
   # Dedicated GPU fan control (fan4) — isolate to GPU metrics only
   GPU_OFFSET="0"
@@ -777,6 +849,11 @@ while true; do
     if (( GPU_FAN_TARGET > GPU_MAX )); then
       GPU_FAN_TARGET=$GPU_MAX
     fi
+  fi
+  if [[ "$GPU_RATE_GAINED" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    GPU_RATE_DELTA=$(awk -v v="$GPU_RATE_GAINED" 'BEGIN { if (!(v == v)) { print 0; exit } if (v >= 0) { printf("%d\n", int(v + 0.5)); } else { printf("%d\n", int(v - 0.5)); } }')
+    [[ -z "$GPU_RATE_DELTA" ]] && GPU_RATE_DELTA=0
+    GPU_FAN_TARGET=$(( GPU_FAN_TARGET + GPU_RATE_DELTA ))
   fi
 
   # Optional GPU boost when GPU temp exceeds threshold
@@ -819,20 +896,21 @@ while true; do
       fi
     fi
   fi
-  [[ "$VERBOSE" == "1" ]] && echo "[loop] CPU=$CPU_TEMP (drive=$CPU_TEMP_FOR_TARGET forecast=$CPU_FORECAST slope=$CPU_SLOPE feed=$CPU_FEED_OFFSET) GPU=$GPU_TEMP (drive=$GPU_TEMP_FOR_TARGET forecast=$GPU_FORECAST slope=$GPU_SLOPE feed=$GPU_FEED_OFFSET) -> system=$SYSTEM_TARGET gpuFan=$GPU_FAN_TARGET" >&2
+  [[ "$VERBOSE" == "1" ]] && echo "[loop] CPU=$CPU_TEMP (drive=$CPU_TEMP_FOR_TARGET forecast=$CPU_FORECAST slope=$CPU_SLOPE rate=${CPU_RATE_PER_MIN}/m feed=$CPU_FEED_OFFSET fanRate=$CPU_RATE_GAINED) GPU=$GPU_TEMP (drive=$GPU_TEMP_FOR_TARGET forecast=$GPU_FORECAST slope=$GPU_SLOPE rate=${GPU_RATE_PER_MIN}/m feed=$GPU_FEED_OFFSET fanRate=$GPU_RATE_GAINED) -> system=$SYSTEM_TARGET gpuFan=$GPU_FAN_TARGET" >&2
   apply_fan_speed "$SYSTEM_TARGET" "fan4=$GPU_FAN_TARGET"
   # Heartbeat for diagnostics
-  echo "CPU=${CPU_TEMP}C/${CPU_TEMP_FOR_TARGET}C f=${CPU_FORECAST} s=${CPU_SLOPE} feed=${CPU_FEED_OFFSET} GPU=${GPU_TEMP}C/${GPU_TEMP_FOR_TARGET}C f=${GPU_FORECAST} s=${GPU_SLOPE} feed=${GPU_FEED_OFFSET} system=${SYSTEM_TARGET}% gpuFan=${GPU_FAN_TARGET}%" >&2
+  echo "CPU=${CPU_TEMP}C/${CPU_TEMP_FOR_TARGET}C f=${CPU_FORECAST} s=${CPU_SLOPE} rate=${CPU_RATE_PER_MIN}/m feed=${CPU_FEED_OFFSET} fanRate=${CPU_RATE_GAINED} GPU=${GPU_TEMP}C/${GPU_TEMP_FOR_TARGET}C f=${GPU_FORECAST} s=${GPU_SLOPE} rate=${GPU_RATE_PER_MIN}/m feed=${GPU_FEED_OFFSET} fanRate=${GPU_RATE_GAINED} system=${SYSTEM_TARGET}% gpuFan=${GPU_FAN_TARGET}%" >&2
   # Optional runtime overrides from JSON
   if command -v jq >/dev/null 2>&1; then
     CI=$(jq -r '(.checkInterval // empty)' "$FAN_CURVE_FILE" 2>/dev/null || true)
     MS=$(jq -r '(.maxStep // empty)' "$FAN_CURVE_FILE" 2>/dev/null || true)
     [[ -n "$CI" && "$CI" =~ ^[0-9]+$ ]] && CHECK_INTERVAL=$CI
     [[ -n "$MS" && "$MS" =~ ^-?[0-9]+$ ]] && MAX_STEP=$MS
-    if read -r PH PM PHIST PB PGB PD PGD PL PGLD PGN PGNG PMO PGMO < <(jq -r '[.predict.horizon, .predict.minPoints, .predict.history, .predict.blend, .predict.gpuBlend, .predict.deadband, .predict.gpuDeadband, .predict.lead, .predict.gpuLead, .predict.slopeGain, .predict.gpuSlopeGain, .predict.maxOffset, .predict.gpuMaxOffset] | map(if . == null then "" else tostring end) | @tsv' "$FAN_CURVE_FILE" 2>/dev/null); then
+    if read -r PH PM PHIST PW PB PGB PD PGD PL PGLD PGN PGNG PMO PGMO PR PGPR PRD PGDR PRM PGMR PRC PGCR < <(jq -r '[.predict.horizon, .predict.minPoints, .predict.history, .predict.window, .predict.blend, .predict.gpuBlend, .predict.deadband, .predict.gpuDeadband, .predict.lead, .predict.gpuLead, .predict.slopeGain, .predict.gpuSlopeGain, .predict.maxOffset, .predict.gpuMaxOffset, .predict.rateGain, .predict.gpuRateGain, .predict.rateDeadband, .predict.gpuRateDeadband, .predict.rateMax, .predict.gpuRateMax, .predict.rateCooldown, .predict.gpuRateCooldown] | map(if . == null then "" else tostring end) | @tsv' "$FAN_CURVE_FILE" 2>/dev/null); then
       [[ -n "$PH" && "$PH" =~ ^[0-9]+$ ]] && PREDICT_HORIZON=$PH
       [[ -n "$PM" && "$PM" =~ ^[0-9]+$ ]] && PREDICT_MIN_POINTS=$PM
       [[ -n "$PHIST" && "$PHIST" =~ ^[0-9]+$ ]] && PREDICT_HISTORY=$PHIST
+      [[ -n "$PW" && "$PW" =~ ^[0-9]+$ ]] && PREDICT_WINDOW=$PW
       if [[ -n "$PB" && "$PB" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
         PREDICT_BLEND=$PB
       fi
@@ -855,6 +933,30 @@ while true; do
       fi
       [[ -n "$PMO" && "$PMO" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] && PREDICT_MAX_OFFSET=$PMO
       [[ -n "$PGMO" && "$PGMO" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] && PREDICT_GPU_MAX_OFFSET=$PGMO
+      if [[ -n "$PR" && "$PR" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        PREDICT_RATE_GAIN=$PR
+      fi
+      if [[ -n "$PGPR" && "$PGPR" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        PREDICT_GPU_RATE_GAIN=$PGPR
+      fi
+      if [[ -n "$PRD" && "$PRD" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        PREDICT_RATE_DEADBAND=$PRD
+      fi
+      if [[ -n "$PGDR" && "$PGDR" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        PREDICT_GPU_RATE_DEADBAND=$PGDR
+      fi
+      if [[ -n "$PRM" && "$PRM" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        PREDICT_RATE_MAX=$PRM
+      fi
+      if [[ -n "$PGMR" && "$PGMR" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        PREDICT_GPU_RATE_MAX=$PGMR
+      fi
+      if [[ -n "$PRC" && "$PRC" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        PREDICT_RATE_COOLDOWN=$PRC
+      fi
+      if [[ -n "$PGCR" && "$PGCR" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        PREDICT_GPU_RATE_COOLDOWN=$PGCR
+      fi
     fi
   fi
   sleep $CHECK_INTERVAL
