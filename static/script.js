@@ -189,12 +189,13 @@ const computeTempForecast = (key, currentValue) => {
   if (!history || history.length < 3) {
     return { forecast: currentValue, slope: 0 };
   }
-  const base = history[0].t;
+  const recent = history.slice(-12);
+  const base = recent[0].t;
   let sumX = 0;
   let sumY = 0;
   let sumXY = 0;
   let sumXX = 0;
-  for (const p of history) {
+  for (const p of recent) {
     const x = (p.t - base) / 1000;
     const y = p.value;
     sumX += x;
@@ -202,14 +203,14 @@ const computeTempForecast = (key, currentValue) => {
     sumXY += x * y;
     sumXX += x * x;
   }
-  const n = history.length;
+  const n = recent.length;
   const denom = n * sumXX - sumX * sumX;
   if (Math.abs(denom) < 1e-6) {
     return { forecast: currentValue, slope: 0 };
   }
   const slope = (n * sumXY - sumX * sumY) / denom;
   const intercept = (sumY - slope * sumX) / n;
-  const lastX = (history[n - 1].t - base) / 1000;
+  const lastX = (recent[n - 1].t - base) / 1000;
   const horizonSeconds = trendHorizonSeconds;
   let forecast = intercept + slope * (lastX + horizonSeconds);
   if (!Number.isFinite(forecast)) {
